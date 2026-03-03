@@ -206,7 +206,7 @@ async def delivery(m: Message):
 
 @dp.message(F.text == "☎️ Контакти")
 async def contacts(m: Message):
-    await m.answer("☎️ Контакти:\nМенеджер: @your_manager\nТел: +380…")
+    await m.answer("☎️ Контакти:\nМенеджер: @ruslanshum\nТел: +380973080330")
 
 
 @dp.message(F.text == "🧾 Мої замовлення")
@@ -353,7 +353,7 @@ async def flow(m: Message):
     if step == "datetime":
         draft[user_id]["datetime"] = (m.text or "").strip()
         draft[user_id]["step"] = "comment"
-        await m.answer("💬 Коментар (можна написати або надіслати '-' якщо без коментаря):")
+        await m.answer("💬 Коментар (якщо доставка Новою Поштою, то вкажіть місто та номер відділення та ваші ПІБ отримувача і телефон отримувача):")
         return
 
     if step == "comment":
@@ -532,4 +532,5 @@ def build_app():
 
 
 if __name__ == "__main__":
+
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
