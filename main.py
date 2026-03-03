@@ -179,7 +179,6 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
 # ---------- file_id helper (admin only, safe) ----------
-# ---------- file_id helper (admin only, safe) ----------
 @dp.message(Command("fileid"))
 async def fileid_help(m: Message):
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
@@ -192,6 +191,7 @@ async def fileid_help(m: Message):
         "Щоб вимкнути — /fileidoff"
     )
 
+
 @dp.message(Command("fileidoff"))
 async def fileid_off(m: Message):
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
@@ -200,7 +200,7 @@ async def fileid_off(m: Message):
     await m.answer("✅ Режим file_id вимкнено.")
 
 
-# 1) Окреме фото
+# 1) Окреме фото (працює в більшості випадків)
 @dp.message(F.photo)
 async def fileid_photo(m: Message):
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
@@ -220,11 +220,26 @@ async def fileid_album(m: Message):
     if not fileid_mode.get(m.from_user.id, False):
         return
 
-    # В альбомі кожне повідомлення приходить окремо.
-    # Беремо file_id якщо це фото:
     if m.photo:
         photo = m.photo[-1]
         await m.answer(f"✅ file_id (album):\n`{photo.file_id}`", parse_mode="Markdown")
+
+
+# 3) Гарантований перехват (коли Telegram/aiogram не дає спрацювати F.photo)
+#    Працює тільки коли увімкнений /fileid, і не дає flow "з'їдати" фото.
+@dp.message()
+async def admin_fileid_catchall(m: Message):
+    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
+        return
+    if not fileid_mode.get(m.from_user.id, False):
+        return
+
+    if m.photo:
+        photo = m.photo[-1]
+        await m.answer(f"✅ file_id:\n`{photo.file_id}`", parse_mode="Markdown")
+        return
+
+    await m.answer("Надішли саме фото (Gallery/Фото), не файл. Або вимкни режим: /fileidoff")
 
 
 # ---------- main bot ----------
@@ -344,7 +359,8 @@ async def checkout(cb: CallbackQuery):
     await cb.answer()
 
 
-@dp.message()
+# IMPORTANT: flow must be TEXT-only, so it won't swallow photos (file_id mode etc.)
+@dp.message(F.text)
 async def flow(m: Message):
     user_id = m.from_user.id
     if user_id not in draft:
@@ -564,11 +580,9 @@ async def on_shutdown(app: web.Application):
 
 async def handle_webhook(request: web.Request):
     try:
-        # Telegram sends POST JSON updates
         if request.method != "POST":
             return web.Response(text="ok")
 
-        # Safer JSON parsing
         try:
             update = await request.json()
         except Exception as e:
@@ -580,7 +594,6 @@ async def handle_webhook(request: web.Request):
         return web.Response(text="ok")
 
     except Exception as e:
-        # Never return 500 to Telegram; log and return 200
         print("Webhook handler error:", repr(e))
         return web.Response(text="ok")
 
@@ -595,7 +608,6 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
-
 
 
 
