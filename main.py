@@ -26,13 +26,12 @@ CURRENCY = os.getenv("CURRENCY", "UAH").strip()
 SOURCE = os.getenv("SOURCE", "Telegram").strip()
 
 # WEBHOOK_BASE:
-# 1) беремо явно заданий WEBHOOK_BASE
-# 2) або Render автоматично дає зовнішній URL у RENDER_EXTERNAL_URL
+# 1) WEBHOOK_BASE
+# 2) або Render дає RENDER_EXTERNAL_URL
 WEBHOOK_BASE = (os.getenv("WEBHOOK_BASE", "").strip() or os.getenv("RENDER_EXTERNAL_URL", "").strip())
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
 PORT = int((os.getenv("PORT", "10000") or "10000"))
 
-# Нормалізація base
 WEBHOOK_BASE = WEBHOOK_BASE.rstrip("/") if WEBHOOK_BASE else ""
 
 if not BOT_TOKEN:
@@ -46,25 +45,26 @@ if MANAGER_CHAT_ID == 0:
 
 # =========================
 # Catalog
+# ВАЖЛИВО: file_id треба ОНОВИТИ для нового бота!
 # =========================
 CATALOG = {
     "Десерти": [
         {"sku": "cake_napoleon", "title": "Торт «Наполеон»", "price": 650,
-         "photo": "AgACAgIAAxkBAAMJaacc9kpUc_EdvU-XfbkjQCWa01AAApkWaxv08DlJ2rkz1l29lGMBAAMCAANtAAM6BA"},
+         "photo": "PASTE_NEW_FILE_ID_HERE"},
         {"sku": "cake_honey", "title": "Торт «Медовик»", "price": 620,
-         "photo": "AgACAgIAAxkBAAMOaacc9hZjaZmtsgABTRYPx7fO4-INAAKdFmsb9PA5SUrTu3KAaDU3AQADAgADbQADOgQ"},
+         "photo": "PASTE_NEW_FILE_ID_HERE"},
         {"sku": "cupcake", "title": "Капкейки (1 шт)", "price": 55,
-         "photo": "AgACAgIAAxkBAAMLaacc9jxet-_eGtSH9Fj8GM5c3scAApsWaxv08DlJtn65zZ4ErawBAAMCAAN5AAM6BA"},
+         "photo": "PASTE_NEW_FILE_ID_HERE"},
     ],
     "Напої": [
         {"sku": "coffee", "title": "Кава", "price": 60,
-         "photo": "AgACAgIAAxkBAAMNaacc9tuWNOYqH00S2qaMEhltcoMAAp4Waxv08DlJuR82ZcifkGUBAAMCAAN4AAM6BA"},
+         "photo": "PASTE_NEW_FILE_ID_HERE"},
         {"sku": "tea", "title": "Чай", "price": 40,
-         "photo": "AgACAgIAAxkBAAMMaacc9le1Sejata1aqhn_GQvx4bQAApwWaxv08DlJ5dFeV8JBjI4BAAMCAAN5AAM6BA"},
+         "photo": "PASTE_NEW_FILE_ID_HERE"},
     ],
     "Інше": [
         {"sku": "gift_box", "title": "Подарункова коробка", "price": 80,
-         "photo": "AgACAgIAAxkBAAMKaacc9hvdBT4ZNNG0kvk0l3ZrKzwAApoWaxv08DlJC4iaj3_p03EBAAMCAAN4AAM6BA"},
+         "photo": "PASTE_NEW_FILE_ID_HERE"},
     ],
 }
 
@@ -167,6 +167,31 @@ async def gs_update_status(session: ClientSession, order_id: str, status: str) -
         except Exception:
             return {"ok": False, "error": f"Bad response: {text[:200]}"}
 
+async def safe_edit(cb: CallbackQuery, text: str, reply_markup=None):
+    """
+    Безпечне редагування:
+    - якщо message текстова -> edit_text
+    - якщо message з фото/медіа -> edit_caption
+    - якщо не вийшло -> відправляємо нове повідомлення
+    """
+    msg = cb.message
+    try:
+        if msg.text is not None:
+            await msg.edit_text(text, reply_markup=reply_markup)
+            return
+        # якщо це фото/медіа з caption
+        if msg.caption is not None or msg.photo or msg.document or msg.video:
+            await msg.edit_caption(caption=text, reply_markup=reply_markup)
+            return
+    except Exception as e:
+        print("safe_edit failed:", repr(e))
+
+    # fallback: просто нове повідомлення
+    try:
+        await msg.answer(text, reply_markup=reply_markup)
+    except Exception as e:
+        print("safe_edit fallback send failed:", repr(e))
+
 # =========================
 # Bot + Dispatcher
 # =========================
@@ -240,7 +265,7 @@ async def my_orders_stub(m: Message):
 
 @dp.callback_query(F.data == "cats")
 async def cats(cb: CallbackQuery):
-    await cb.message.edit_text("Оберіть категорію:", reply_markup=categories_kb())
+    await safe_edit(cb, "Оберіть категорію:", reply_markup=categories_kb())
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("cat:"))
@@ -256,7 +281,8 @@ async def cat(cb: CallbackQuery):
     kb.append([InlineKeyboardButton(text="🧺 Кошик", callback_data="cart")])
     kb.append([InlineKeyboardButton(text="⬅️ Категорії", callback_data="cats")])
 
-    await cb.message.edit_text(
+    await safe_edit(
+        cb,
         f"📦 {cat_name}:\nОберіть товар нижче (натисніть на назву).",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
     )
@@ -276,10 +302,16 @@ async def prod(cb: CallbackQuery):
         "Додати в кошик?"
     )
 
+    # показуємо окремим повідомленням (ок)
     if item.get("photo"):
-        await cb.message.answer_photo(photo=item["photo"], caption=text, reply_markup=product_kb(sku))
+        try:
+            await cb.message.answer_photo(photo=item["photo"], caption=text, reply_markup=product_kb(sku))
+        except Exception as e:
+            print("answer_photo failed:", repr(e))
+            await cb.message.answer(text + "\n\n⚠️ Фото недоступне. Перевірте file_id для цього бота.", reply_markup=product_kb(sku))
     else:
         await cb.message.answer(text, reply_markup=product_kb(sku))
+
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("add:"))
@@ -302,14 +334,14 @@ async def rem(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "cart")
 async def cart(cb: CallbackQuery):
-    await cb.message.edit_text(cart_text(cb.from_user.id), reply_markup=cart_kb())
+    await safe_edit(cb, cart_text(cb.from_user.id), reply_markup=cart_kb())
     await cb.answer()
 
 @dp.callback_query(F.data == "clear")
 async def clear(cb: CallbackQuery):
     carts[cb.from_user.id] = {}
     draft.pop(cb.from_user.id, None)
-    await cb.message.edit_text("🧺 Кошик очищено.", reply_markup=categories_kb())
+    await safe_edit(cb, "🧺 Кошик очищено.", reply_markup=categories_kb())
     await cb.answer()
 
 @dp.callback_query(F.data == "checkout")
@@ -320,6 +352,24 @@ async def checkout(cb: CallbackQuery):
     draft[cb.from_user.id] = {"step": "name"}
     await cb.message.answer("✍️ Введіть ваше ім’я:")
     await cb.answer()
+
+# --- phone via contact (ВАЖЛИВО) ---
+@dp.message(F.contact)
+async def flow_contact(m: Message):
+    user_id = m.from_user.id
+    if user_id not in draft:
+        return
+    if draft[user_id].get("step") != "phone":
+        return
+
+    phone = (m.contact.phone_number or "").strip()
+    draft[user_id]["phone"] = phone
+    draft[user_id]["step"] = "deliveryType"
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="🚚 Доставка"), KeyboardButton(text="🏃 Самовивіз")]],
+        resize_keyboard=True, one_time_keyboard=True
+    )
+    await m.answer("Оберіть тип отримання:", reply_markup=kb)
 
 # FLOW: тільки текст
 @dp.message(F.text)
@@ -421,7 +471,7 @@ async def flow(m: Message):
 async def cancel(cb: CallbackQuery):
     carts[cb.from_user.id] = {}
     draft.pop(cb.from_user.id, None)
-    await cb.message.edit_text("❌ Замовлення скасовано.")
+    await safe_edit(cb, "❌ Замовлення скасовано.")
     await cb.answer()
 
 @dp.callback_query(F.data == "confirm")
@@ -467,7 +517,8 @@ async def confirm(cb: CallbackQuery):
         return
 
     order_id = str(res.get("orderId", ""))
-    await cb.message.edit_text(f"🎉 Дякуємо! Замовлення прийнято.\nНомер: #{order_id}\nМенеджер скоро зв’яжеться.")
+    await safe_edit(cb, f"🎉 Дякуємо! Замовлення прийнято.\nНомер: #{order_id}\nМенеджер скоро зв’яжеться.")
+    await cb.answer("Готово ✅")
 
     mgr_text = [
         f"🆕 НОВЕ ЗАМОВЛЕННЯ #{order_id}",
@@ -494,7 +545,6 @@ async def confirm(cb: CallbackQuery):
 
     carts[user_id] = {}
     draft.pop(user_id, None)
-    await cb.answer("Готово ✅")
 
 @dp.callback_query(F.data.startswith("st:"))
 async def set_status(cb: CallbackQuery):
@@ -520,7 +570,7 @@ async def set_status(cb: CallbackQuery):
 # =========================
 async def on_startup(app: web.Application):
     if not WEBHOOK_BASE:
-        print("⚠️ WEBHOOK_BASE is empty. Webhook will NOT be set. (Set WEBHOOK_BASE or rely on RENDER_EXTERNAL_URL)")
+        print("⚠️ WEBHOOK_BASE is empty. Webhook will NOT be set.")
         return
 
     webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
@@ -562,8 +612,6 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
-
-
 
 
 
