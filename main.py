@@ -1,7 +1,7 @@
 import os
 import json
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, F
@@ -16,8 +16,16 @@ from aiogram.filters import CommandStart, Command
 # ENV
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit())
-MANAGER_CHAT_ID = int(os.getenv("MANAGER_CHAT_ID", "0").strip() or "0")
+
+ADMIN_IDS = set(
+    int(x) for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+)
+
+# IMPORTANT:
+# For private chat, chat_id == user_id (positive).
+# For groups/supergroups it is negative.
+MANAGER_CHAT_ID = int((os.getenv("MANAGER_CHAT_ID", "0").strip() or "0"))
 
 GS_ENDPOINT = os.getenv("GS_ENDPOINT", "").strip()
 GS_KEY = os.getenv("GS_KEY", "").strip()
@@ -27,8 +35,11 @@ SOURCE = os.getenv("SOURCE", "Telegram").strip()
 
 WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip()  # e.g. https://tg-order-bot-lywy.onrender.com
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
-PORT = int(os.getenv("PORT", "10000"))
 
+# Render sets PORT. Sometimes it can be empty string in misconfigs -> protect.
+PORT = int(os.getenv("PORT", "10000") or "10000")
+
+# Hard requirements (keep strict for production)
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
 if not GS_ENDPOINT:
@@ -40,22 +51,30 @@ if MANAGER_CHAT_ID == 0:
 if not WEBHOOK_BASE:
     raise RuntimeError("WEBHOOK_BASE is required")
 
+# Normalize base (remove trailing slash)
+WEBHOOK_BASE = WEBHOOK_BASE.rstrip("/")
+
 # =========================
 # Simple demo catalog (in code)
-# Later move to /admin editing if needed.
 # =========================
 CATALOG = {
     "Десерти": [
-        {"sku": "cake_napoleon", "title": "Торт «Наполеон»", "price": 650, "photo": "AgACAgIAAxkBAAOdaab0HY12878k8OAnDwV_pJjkVQsAAkYTaxvOjDlJQYBq-IPJcSQBAAMCAANtAAM6BA"},
-        {"sku": "cake_honey", "title": "Торт «Медовик»", "price": 620, "photo": "AgACAgIAAxkBAAObaab0FnC3pkssG8ZdFQuYd8WY9IwAAkUTaxvOjDlJTBar3BbZh5EBAAMCAANtAAM6BA"},
-        {"sku": "cupcake", "title": "Капкейки (1 шт)", "price": 55, "photo": "AgACAgIAAxkBAAOVaabz-C5YXwKqrPRzXw7UtzJfhHkAAkITaxvOjDlJdC34GFtFGf0BAAMCAAN5AAM6BA"},
+        {"sku": "cake_napoleon", "title": "Торт «Наполеон»", "price": 650,
+         "photo": "AgACAgIAAxkBAAOdaab0HY12878k8OAnDwV_pJjkVQsAAkYTaxvOjDlJQYBq-IPJcSQBAAMCAANtAAM6BA"},
+        {"sku": "cake_honey", "title": "Торт «Медовик»", "price": 620,
+         "photo": "AgACAgIAAxkBAAObaab0FnC3pkssG8ZdFQuYd8WY9IwAAkUTaxvOjDlJTBar3BbZh5EBAAMCAANtAAM6BA"},
+        {"sku": "cupcake", "title": "Капкейки (1 шт)", "price": 55,
+         "photo": "AgACAgIAAxkBAAOVaabz-C5YXwKqrPRzXw7UtzJfhHkAAkITaxvOjDlJdC34GFtFGf0BAAMCAAN5AAM6BA"},
     ],
     "Напої": [
-        {"sku": "coffee", "title": "Кава", "price": 60, "photo": "AgACAgIAAxkBAAOZaab0Dv8hYBTSwZZBIY-7YFayRFMAAkQTaxvOjDlJ_TLHnFebP9cBAAMCAAN4AAM6BA"},
-        {"sku": "tea", "title": "Чай", "price": 40, "photo": "AgACAgIAAxkBAAOXaab0AAEGGf_f6oDotHPYl8agvHVzAAJDE2sbzow5SRdQOqvfBqu9AQADAgADeQADOgQ"},
+        {"sku": "coffee", "title": "Кава", "price": 60,
+         "photo": "AgACAgIAAxkBAAOZaab0Dv8hYBTSwZZBIY-7YFayRFMAAkQTaxvOjDlJ_TLHnFebP9cBAAMCAAN4AAM6BA"},
+        {"sku": "tea", "title": "Чай", "price": 40,
+         "photo": "AgACAgIAAxkBAAOXaab0AAEGGf_f6oDotHPYl8agvHVzAAJDE2sbzow5SRdQOqvfBqu9AQADAgADeQADOgQ"},
     ],
     "Інше": [
-        {"sku": "gift_box", "title": "Подарункова коробка", "price": 80, "photo": "AgACAgIAAxkBAAN7aabwno4x3rFsLX6VfmbBFE9vdtsAAhMTaxvOjDlJj4MhYEhqQ_cBAAMCAAN4AAM6BA"},
+        {"sku": "gift_box", "title": "Подарункова коробка", "price": 80,
+         "photo": "AgACAgIAAxkBAAN7aabwno4x3rFsLX6VfmbBFE9vdtsAAhMTaxvOjDlJj4MhYEhqQ_cBAAMCAAN4AAM6BA"},
     ],
 }
 
@@ -64,8 +83,6 @@ CATALOG = {
 # =========================
 carts: Dict[int, Dict[str, int]] = {}   # user_id -> {sku: qty}
 draft: Dict[int, Dict[str, Any]] = {}   # user_id -> order draft fields
-
-# /fileid mode flag (so we don't break normal flow)
 fileid_mode: Dict[int, bool] = {}       # user_id -> True/False
 
 
@@ -85,9 +102,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 
 
 def categories_kb() -> InlineKeyboardMarkup:
-    buttons = []
-    for cat in CATALOG.keys():
-        buttons.append([InlineKeyboardButton(text=cat, callback_data=f"cat:{cat}")])
+    buttons = [[InlineKeyboardButton(text=cat, callback_data=f"cat:{cat}")] for cat in CATALOG.keys()]
     buttons.append([InlineKeyboardButton(text="🧺 Кошик", callback_data="cart")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -112,7 +127,7 @@ def cart_kb() -> InlineKeyboardMarkup:
 
 
 def manager_status_kb(order_id: str, user_tg_id: str) -> InlineKeyboardMarkup:
-    def b(text, status):
+    def b(text: str, status: str) -> InlineKeyboardButton:
         return InlineKeyboardButton(text=text, callback_data=f"st:{order_id}:{status}:{user_tg_id}")
 
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -122,10 +137,10 @@ def manager_status_kb(order_id: str, user_tg_id: str) -> InlineKeyboardMarkup:
     ])
 
 
-def find_item_by_sku(sku: str) -> Dict[str, Any] | None:
+def find_item_by_sku(sku: str) -> Optional[Dict[str, Any]]:
     for _, items in CATALOG.items():
         for it in items:
-            if it["sku"] == sku:
+            if it.get("sku") == sku:
                 return it
     return None
 
@@ -178,11 +193,12 @@ async def gs_update_status(session: ClientSession, order_id: str, status: str) -
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
+# ---------- diagnostics ----------
+@dp.message(Command("ping"))
+async def ping(m: Message):
+    await m.answer("pong ✅")
 
-
-
-
-# ---------- file_id helper (admin only, safe) ----------
+# ---------- file_id helper ----------
 @dp.message(Command("fileid"))
 async def fileid_help(m: Message):
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
@@ -191,7 +207,6 @@ async def fileid_help(m: Message):
     await m.answer(
         "✅ Режим file_id увімкнено.\n"
         "Надішли 1 фото як повідомлення (не файлом). Я відповім file_id.\n"
-        "Якщо надсилаєш кілька фото одразу (альбом) — я теж відповім.\n"
         "Щоб вимкнути — /fileidoff"
     )
 
@@ -204,33 +219,17 @@ async def fileid_off(m: Message):
     await m.answer("✅ Режим file_id вимкнено.")
 
 
-# 1) Окреме фото (працює в більшості випадків)
 @dp.message(F.photo)
 async def fileid_photo(m: Message):
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
         return
     if not fileid_mode.get(m.from_user.id, False):
         return
-
     photo = m.photo[-1]
     await m.answer(f"✅ file_id:\n{photo.file_id}")
 
 
-# 2) Альбом (media_group)
-@dp.message(F.media_group_id)
-async def fileid_album(m: Message):
-    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
-        return
-    if not fileid_mode.get(m.from_user.id, False):
-        return
-
-    if m.photo:
-        photo = m.photo[-1]
-        await m.answer(f"✅ file_id:\n{photo.file_id}")
-
-
-# 3) Гарантований перехват (коли Telegram/aiogram не дає спрацювати F.photo)
-#    Працює тільки коли увімкнений /fileid, і не дає flow "з'їдати" фото.
+# Catch-all only when fileid_mode enabled (won't affect normal flow)
 @dp.message()
 async def admin_fileid_catchall(m: Message):
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
@@ -297,7 +296,10 @@ async def cat(cb: CallbackQuery):
     text_lines = [f"📦 {cat_name}:\nОберіть товар нижче (натисніть на назву)."]
     kb = []
     for it in items:
-        kb.append([InlineKeyboardButton(text=f"{it['title']} — {it['price']} {CURRENCY}", callback_data=f"prod:{it['sku']}")])
+        kb.append([InlineKeyboardButton(
+            text=f"{it['title']} — {it['price']} {CURRENCY}",
+            callback_data=f"prod:{it['sku']}"
+        )])
     kb.append([InlineKeyboardButton(text="🧺 Кошик", callback_data="cart")])
     kb.append([InlineKeyboardButton(text="⬅️ Категорії", callback_data="cats")])
     await cb.message.edit_text("\n".join(text_lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
@@ -308,7 +310,6 @@ async def cat(cb: CallbackQuery):
 async def prod(cb: CallbackQuery):
     sku = cb.data.split(":", 1)[1]
     item = find_item_by_sku(sku)
-
     if not item:
         await cb.answer("Товар не знайдено", show_alert=True)
         return
@@ -319,18 +320,10 @@ async def prod(cb: CallbackQuery):
         "Додати в кошик?"
     )
 
-    # Якщо є фото — показуємо фото
     if item.get("photo"):
-        await cb.message.answer_photo(
-            photo=item["photo"],
-            caption=text,
-            reply_markup=product_kb(sku)
-        )
+        await cb.message.answer_photo(photo=item["photo"], caption=text, reply_markup=product_kb(sku))
     else:
-        await cb.message.answer(
-            text,
-            reply_markup=product_kb(sku)
-        )
+        await cb.message.answer(text, reply_markup=product_kb(sku))
 
     await cb.answer()
 
@@ -374,13 +367,12 @@ async def checkout(cb: CallbackQuery):
     if not carts.get(cb.from_user.id):
         await cb.answer("Кошик порожній", show_alert=True)
         return
-
     draft[cb.from_user.id] = {"step": "name"}
     await cb.message.answer("✍️ Введіть ваше ім’я:")
     await cb.answer()
 
 
-# IMPORTANT: flow must be TEXT-only, so it won't swallow photos (file_id mode etc.)
+# IMPORTANT: text-only flow, so it won't swallow photos
 @dp.message(F.text)
 async def flow(m: Message):
     user_id = m.from_user.id
@@ -465,7 +457,7 @@ async def flow(m: Message):
             f"Ім’я: {draft[user_id]['name']}",
             f"Телефон: {draft[user_id]['phone']}",
             f"Тип: {draft[user_id]['deliveryType']}",
-            f"Адреса: {draft[user_id].get('address','-')}",
+            f"Адреса: {draft[user_id].get('address', '-')}",
             f"Дата/час: {draft[user_id]['datetime']}",
             f"Коментар: {draft[user_id]['comment'] or '-'}",
         ]
@@ -534,17 +526,19 @@ async def confirm(cb: CallbackQuery):
         return
 
     order_id = str(res.get("orderId", ""))
-    await cb.message.edit_text(f"🎉 Дякуємо! Замовлення прийнято.\nНомер: #{order_id}\nМенеджер скоро зв’яжеться.")
+    await cb.message.edit_text(
+        f"🎉 Дякуємо! Замовлення прийнято.\nНомер: #{order_id}\nМенеджер скоро зв’яжеться."
+    )
 
     mgr_text = [
         f"🆕 НОВЕ ЗАМОВЛЕННЯ #{order_id}",
-        f"Ім’я: {d.get('name','')}",
-        f"Телефон: {d.get('phone','')}",
+        f"Ім’я: {d.get('name', '')}",
+        f"Телефон: {d.get('phone', '')}",
         f"Telegram: @{cb.from_user.username}" if cb.from_user.username else f"Telegram ID: {user_id}",
-        f"Тип: {d.get('deliveryType','')}",
-        f"Адреса/самовивіз: {d.get('address','-')}",
-        f"Дата/час: {d.get('datetime','')}",
-        f"Коментар: {d.get('comment','-') or '-'}",
+        f"Тип: {d.get('deliveryType', '')}",
+        f"Адреса/самовивіз: {d.get('address', '-')}",
+        f"Дата/час: {d.get('datetime', '')}",
+        f"Коментар: {d.get('comment', '-') or '-'}",
         "",
         "Склад:"
     ]
@@ -561,13 +555,13 @@ async def confirm(cb: CallbackQuery):
 
     carts[user_id] = {}
     draft.pop(user_id, None)
-
     await cb.answer("Готово ✅")
 
 
 @dp.callback_query(F.data.startswith("st:"))
 async def set_status(cb: CallbackQuery):
-    if ADMIN_IDS and cb.from_user.id not in ADMIN_IDS and cb.from_user.id != MANAGER_CHAT_ID:
+    # Manager button presses: safest is to require ADMIN_IDS.
+    if ADMIN_IDS and cb.from_user.id not in ADMIN_IDS:
         await cb.answer("Немає доступу", show_alert=True)
         return
 
@@ -591,20 +585,26 @@ async def set_status(cb: CallbackQuery):
 # =========================
 async def on_startup(app: web.Application):
     webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
-
-    # ВАЖЛИВО: перед встановленням завжди чистимо попередній webhook
-    await bot.delete_webhook(drop_pending_updates=True)
-
-    await bot.set_webhook(webhook_url)
-    print("✅ Webhook set to:", webhook_url)
+    try:
+        # Important: do not crash the whole service if Telegram rejects it temporarily
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.set_webhook(webhook_url)
+        print("✅ Webhook set to:", webhook_url)
+    except Exception as e:
+        print("❌ Webhook setup failed:", repr(e))
+        # Keep service alive anyway (Render healthcheck + logs will work)
 
 
 async def on_shutdown(app: web.Application):
-    await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
     await bot.session.close()
 
 
 async def handle_webhook(request: web.Request):
+    # Always return 200 to Telegram, never 500
     try:
         if request.method != "POST":
             return web.Response(text="ok")
@@ -616,7 +616,11 @@ async def handle_webhook(request: web.Request):
             print("Webhook JSON parse error:", repr(e), "Body head:", body[:200])
             return web.Response(text="ok")
 
-        await dp.feed_raw_update(bot, update)
+        try:
+            await dp.feed_raw_update(bot, update)
+        except Exception as e:
+            print("dp.feed_raw_update error:", repr(e))
+
         return web.Response(text="ok")
 
     except Exception as e:
@@ -624,11 +628,10 @@ async def handle_webhook(request: web.Request):
         return web.Response(text="ok")
 
 
-def build_app():
+def build_app() -> web.Application:
     app = web.Application()
 
-    # healthcheck
-    async def health(_request):
+    async def health(_request: web.Request):
         return web.Response(text="ok")
 
     app.router.add_get("/", health)
@@ -638,6 +641,10 @@ def build_app():
     app.on_shutdown.append(on_shutdown)
     return app
 
+
+if __name__ == "__main__":
+    print(f"🚀 Starting on 0.0.0.0:{PORT} | webhook: {WEBHOOK_BASE}{WEBHOOK_PATH}")
+    web.run_app(build_app(), host="0.0.0.0", port=PORT)
 
 
 
