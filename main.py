@@ -1,6 +1,5 @@
 import os
 import json
-import asyncio
 from datetime import datetime
 from typing import Dict, Any, List
 
@@ -11,7 +10,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton
 )
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 
 # =========================
 # ENV
@@ -39,7 +38,6 @@ if not GS_KEY:
 if MANAGER_CHAT_ID == 0:
     raise RuntimeError("MANAGER_CHAT_ID is required")
 if not WEBHOOK_BASE:
-    # On Render we'll set it to the service URL
     raise RuntimeError("WEBHOOK_BASE is required")
 
 # =========================
@@ -64,8 +62,11 @@ CATALOG = {
 # =========================
 # State (RAM) - OK for demo
 # =========================
-carts: Dict[int, Dict[str, int]] = {}  # user_id -> {sku: qty}
-draft: Dict[int, Dict[str, Any]] = {}  # user_id -> order draft fields
+carts: Dict[int, Dict[str, int]] = {}   # user_id -> {sku: qty}
+draft: Dict[int, Dict[str, Any]] = {}   # user_id -> order draft fields
+
+# /fileid mode flag (so we don't break normal flow)
+fileid_mode: Dict[int, bool] = {}       # user_id -> True/False
 
 
 def now_str() -> str:
@@ -111,7 +112,6 @@ def cart_kb() -> InlineKeyboardMarkup:
 
 
 def manager_status_kb(order_id: str, user_tg_id: str) -> InlineKeyboardMarkup:
-    # user_tg_id stored to optionally notify the client on status change
     def b(text, status):
         return InlineKeyboardButton(text=text, callback_data=f"st:{order_id}:{status}:{user_tg_id}")
 
@@ -123,7 +123,7 @@ def manager_status_kb(order_id: str, user_tg_id: str) -> InlineKeyboardMarkup:
 
 
 def find_item_by_sku(sku: str) -> Dict[str, Any] | None:
-    for cat, items in CATALOG.items():
+    for _, items in CATALOG.items():
         for it in items:
             if it["sku"] == sku:
                 return it
@@ -154,7 +154,6 @@ def cart_text(user_id: int) -> str:
 
 
 async def gs_create_order(session: ClientSession, payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Apps Script expects {key, action, bizId, order:{...}}
     async with session.post(GS_ENDPOINT, json=payload, timeout=20) as resp:
         text = await resp.text()
         try:
@@ -179,34 +178,46 @@ async def gs_update_status(session: ClientSession, order_id: str, status: str) -
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-from aiogram.filters import Command
-
+# ---------- file_id helper (admin only, safe) ----------
 @dp.message(Command("fileid"))
 async def fileid_help(m: Message):
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
         return
-    await m.answer("Надішли мені фото як повідомлення (не файлом). Я відповім file_id.")
+    fileid_mode[m.from_user.id] = True
+    await m.answer("✅ Режим file_id увімкнено.\nНадішли мені фото як повідомлення (не файлом). Я відповім file_id.\n"
+                   "Щоб вимкнути — /fileidoff")
+
+
+@dp.message(Command("fileidoff"))
+async def fileid_off(m: Message):
+    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
+        return
+    fileid_mode[m.from_user.id] = False
+    await m.answer("✅ Режим file_id вимкнено.")
+
 
 @dp.message(F.photo)
 async def fileid_photo(m: Message):
+    # This handler triggers on ANY photo, so we restrict it:
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
         return
+    if not fileid_mode.get(m.from_user.id, False):
+        return
 
-    # Найкраща якість — останній елемент
     photo = m.photo[-1]
     await m.answer(f"✅ file_id:\n`{photo.file_id}`", parse_mode="Markdown")
 
+
+# ---------- main bot ----------
 @dp.message(CommandStart())
 async def start(m: Message):
-    await m.answer(
-        "👋 Вітаємо у нашій кондитерській!
-
-🎂 Замовляйте торти та десерти онлайн за 1 хвилину.
-Менеджер одразу підтвердить замовлення.
-
-Оберіть дію нижче 👇",
-        reply_markup=main_menu_kb()
+    welcome_text = (
+        "👋 Вітаємо у нашій кондитерській!\n\n"
+        "🎂 Замовляйте торти та десерти онлайн за 1 хвилину.\n"
+        "Менеджер одразу підтвердить замовлення.\n\n"
+        "Оберіть дію нижче 👇"
     )
+    await m.answer(welcome_text, reply_markup=main_menu_kb())
 
 
 @dp.message(F.text == "📦 Каталог / Меню")
@@ -309,7 +320,6 @@ async def checkout(cb: CallbackQuery):
         await cb.answer("Кошик порожній", show_alert=True)
         return
 
-    # init draft
     draft[cb.from_user.id] = {"step": "name"}
     await cb.message.answer("✍️ Введіть ваше ім’я:")
     await cb.answer()
@@ -324,7 +334,7 @@ async def flow(m: Message):
     step = draft[user_id].get("step")
 
     if step == "name":
-        draft[user_id]["name"] = m.text.strip()
+        draft[user_id]["name"] = (m.text or "").strip()
         draft[user_id]["step"] = "phone"
         kb = ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text="📱 Поділитися контактом", request_contact=True)]],
@@ -383,7 +393,6 @@ async def flow(m: Message):
             comment = ""
         draft[user_id]["comment"] = comment
 
-        # Build order summary + confirm
         items: List[Dict[str, Any]] = []
         for sku, qty in carts.get(user_id, {}).items():
             it = find_item_by_sku(sku)
@@ -409,7 +418,7 @@ async def flow(m: Message):
             [InlineKeyboardButton(text="✅ Підтвердити", callback_data="confirm")],
             [InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel")]
         ])
-        # store prepared payload parts
+
         draft[user_id]["items"] = items
         draft[user_id]["total"] = total
 
@@ -471,7 +480,6 @@ async def confirm(cb: CallbackQuery):
     order_id = str(res.get("orderId", ""))
     await cb.message.edit_text(f"🎉 Дякуємо! Замовлення прийнято.\nНомер: #{order_id}\nМенеджер скоро зв’яжеться.")
 
-    # notify manager
     mgr_text = [
         f"🆕 НОВЕ ЗАМОВЛЕННЯ #{order_id}",
         f"Ім’я: {d.get('name','')}",
@@ -495,7 +503,6 @@ async def confirm(cb: CallbackQuery):
         reply_markup=manager_status_kb(order_id, str(user_id))
     )
 
-    # cleanup
     carts[user_id] = {}
     draft.pop(user_id, None)
 
@@ -504,7 +511,6 @@ async def confirm(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("st:"))
 async def set_status(cb: CallbackQuery):
-    # Only managers/admins should press
     if ADMIN_IDS and cb.from_user.id not in ADMIN_IDS and cb.from_user.id != MANAGER_CHAT_ID:
         await cb.answer("Немає доступу", show_alert=True)
         return
@@ -516,7 +522,6 @@ async def set_status(cb: CallbackQuery):
 
     if res.get("ok"):
         await cb.answer(f"Статус: {status} ✅")
-        # notify client (optional)
         try:
             await bot.send_message(int(user_tg_id), f"📦 Статус замовлення #{order_id}: {status}")
         except Exception:
@@ -553,7 +558,5 @@ def build_app():
 
 
 if __name__ == "__main__":
-
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
-
 
