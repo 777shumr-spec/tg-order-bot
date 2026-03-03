@@ -179,14 +179,18 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
 # ---------- file_id helper (admin only, safe) ----------
+# ---------- file_id helper (admin only, safe) ----------
 @dp.message(Command("fileid"))
 async def fileid_help(m: Message):
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
         return
     fileid_mode[m.from_user.id] = True
-    await m.answer("✅ Режим file_id увімкнено.\nНадішли мені фото як повідомлення (не файлом). Я відповім file_id.\n"
-                   "Щоб вимкнути — /fileidoff")
-
+    await m.answer(
+        "✅ Режим file_id увімкнено.\n"
+        "Надішли 1 фото як повідомлення (не файлом). Я відповім file_id.\n"
+        "Якщо надсилаєш кілька фото одразу (альбом) — я теж відповім.\n"
+        "Щоб вимкнути — /fileidoff"
+    )
 
 @dp.message(Command("fileidoff"))
 async def fileid_off(m: Message):
@@ -196,9 +200,9 @@ async def fileid_off(m: Message):
     await m.answer("✅ Режим file_id вимкнено.")
 
 
+# 1) Окреме фото
 @dp.message(F.photo)
 async def fileid_photo(m: Message):
-    # This handler triggers on ANY photo, so we restrict it:
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
         return
     if not fileid_mode.get(m.from_user.id, False):
@@ -206,6 +210,21 @@ async def fileid_photo(m: Message):
 
     photo = m.photo[-1]
     await m.answer(f"✅ file_id:\n`{photo.file_id}`", parse_mode="Markdown")
+
+
+# 2) Альбом (media_group)
+@dp.message(F.media_group_id)
+async def fileid_album(m: Message):
+    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
+        return
+    if not fileid_mode.get(m.from_user.id, False):
+        return
+
+    # В альбомі кожне повідомлення приходить окремо.
+    # Беремо file_id якщо це фото:
+    if m.photo:
+        photo = m.photo[-1]
+        await m.answer(f"✅ file_id (album):\n`{photo.file_id}`", parse_mode="Markdown")
 
 
 # ---------- main bot ----------
@@ -559,5 +578,6 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
