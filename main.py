@@ -1,6 +1,5 @@
 import os
 import json
-import asyncio
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -18,7 +17,7 @@ from aiogram.filters import CommandStart, Command
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_IDS = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit())
-MANAGER_CHAT_ID = int((os.getenv("MANAGER_CHAT_ID", "0") or "0").strip())
+MANAGER_CHAT_ID = int((os.getenv("MANAGER_CHAT_ID", "0").strip() or "0"))
 
 GS_ENDPOINT = os.getenv("GS_ENDPOINT", "").strip()
 GS_KEY = os.getenv("GS_KEY", "").strip()
@@ -26,7 +25,9 @@ BIZ_ID = os.getenv("BIZ_ID", "demo").strip()
 CURRENCY = os.getenv("CURRENCY", "UAH").strip()
 SOURCE = os.getenv("SOURCE", "Telegram").strip()
 
-PORT = int(os.getenv("PORT", "10000") or "10000")
+WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").strip()  # e.g. https://tg-order-bot-lywy.onrender.com
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
+PORT = int((os.getenv("PORT", "10000") or "10000"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
@@ -36,6 +37,11 @@ if not GS_KEY:
     raise RuntimeError("GS_KEY is required")
 if MANAGER_CHAT_ID == 0:
     raise RuntimeError("MANAGER_CHAT_ID is required")
+if not WEBHOOK_BASE:
+    raise RuntimeError("WEBHOOK_BASE is required")
+
+# Нормалізуємо BASE (без слеша в кінці)
+WEBHOOK_BASE = WEBHOOK_BASE.rstrip("/")
 
 # =========================
 # Catalog
@@ -74,7 +80,6 @@ fileid_mode: Dict[int, bool] = {}
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -85,12 +90,10 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
-
 def categories_kb() -> InlineKeyboardMarkup:
     buttons = [[InlineKeyboardButton(text=cat, callback_data=f"cat:{cat}")] for cat in CATALOG.keys()]
     buttons.append([InlineKeyboardButton(text="🧺 Кошик", callback_data="cart")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
 
 def product_kb(sku: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -102,7 +105,6 @@ def product_kb(sku: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Категорії", callback_data="cats")]
     ])
 
-
 def cart_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Оформити", callback_data="checkout")],
@@ -110,25 +112,21 @@ def cart_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Категорії", callback_data="cats")]
     ])
 
-
 def manager_status_kb(order_id: str, user_tg_id: str) -> InlineKeyboardMarkup:
-    def b(text: str, status: str) -> InlineKeyboardButton:
+    def b(text, status):
         return InlineKeyboardButton(text=text, callback_data=f"st:{order_id}:{status}:{user_tg_id}")
-
     return InlineKeyboardMarkup(inline_keyboard=[
         [b("✅ Прийнято", "ACCEPTED"), b("⏳ В роботі", "IN_PROGRESS")],
         [b("🚚 Доставляється", "DELIVERING"), b("✅ Виконано", "DONE")],
         [b("❌ Скасовано", "CANCELED")]
     ])
 
-
 def find_item_by_sku(sku: str) -> Optional[Dict[str, Any]]:
-    for items in CATALOG.values():
+    for _, items in CATALOG.items():
         for it in items:
             if it["sku"] == sku:
                 return it
     return None
-
 
 def calc_total(user_id: int) -> int:
     total = 0
@@ -137,7 +135,6 @@ def calc_total(user_id: int) -> int:
         if item:
             total += int(item["price"]) * int(qty)
     return total
-
 
 def cart_text(user_id: int) -> str:
     items = carts.get(user_id, {})
@@ -152,7 +149,6 @@ def cart_text(user_id: int) -> str:
     lines.append(f"\nРазом: {calc_total(user_id)} {CURRENCY}")
     return "\n".join(lines)
 
-
 async def gs_create_order(session: ClientSession, payload: Dict[str, Any]) -> Dict[str, Any]:
     async with session.post(GS_ENDPOINT, json=payload, timeout=20) as resp:
         text = await resp.text()
@@ -160,7 +156,6 @@ async def gs_create_order(session: ClientSession, payload: Dict[str, Any]) -> Di
             return json.loads(text)
         except Exception:
             return {"ok": False, "error": f"Bad response: {text[:200]}"}
-
 
 async def gs_update_status(session: ClientSession, order_id: str, status: str) -> Dict[str, Any]:
     payload = {"key": GS_KEY, "action": "updateStatus", "bizId": BIZ_ID, "orderId": order_id, "status": status}
@@ -172,12 +167,12 @@ async def gs_update_status(session: ClientSession, order_id: str, status: str) -
             return {"ok": False, "error": f"Bad response: {text[:200]}"}
 
 # =========================
-# Bot
+# Bot + Dispatcher
 # =========================
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-# ---------- file_id helper ----------
+# ---------- admin file_id ----------
 @dp.message(Command("fileid"))
 async def fileid_help(m: Message):
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
@@ -205,27 +200,11 @@ async def fileid_photo(m: Message):
     photo = m.photo[-1]
     await m.answer(f"✅ file_id:\n{photo.file_id}")
 
-@dp.message()
-async def admin_fileid_catchall(m: Message):
-    # щоб не ламати звичайну роботу — працює тільки в режимі /fileid
-    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
-        return
-    if not fileid_mode.get(m.from_user.id, False):
-        return
-
-    # не перехоплюємо команди
-    if m.text and m.text.strip().startswith("/"):
-        return
-
-    if m.photo:
-        photo = m.photo[-1]
-        await m.answer(f"✅ file_id:\n{photo.file_id}")
-        return
-
-    # якщо в режимі file_id надіслали не фото
-    await m.answer("Надішли саме фото (Gallery/Фото), не файл. Або вимкни режим: /fileidoff")
-
 # ---------- main bot ----------
+@dp.message(Command("ping"))
+async def ping(m: Message):
+    await m.answer("pong ✅")
+
 @dp.message(CommandStart())
 async def start(m: Message):
     welcome_text = (
@@ -235,10 +214,6 @@ async def start(m: Message):
         "Оберіть дію нижче 👇"
     )
     await m.answer(welcome_text, reply_markup=main_menu_kb())
-
-@dp.message(Command("ping"))
-async def ping(m: Message):
-    await m.answer("pong ✅")
 
 @dp.message(F.text == "📦 Каталог / Меню")
 @dp.message(F.text == "🛒 Зробити замовлення")
@@ -271,7 +246,6 @@ async def cats(cb: CallbackQuery):
 async def cat(cb: CallbackQuery):
     cat_name = cb.data.split(":", 1)[1]
     items = CATALOG.get(cat_name, [])
-    text_lines = [f"📦 {cat_name}:\nОберіть товар нижче (натисніть на назву)."]
     kb = []
     for it in items:
         kb.append([InlineKeyboardButton(
@@ -280,7 +254,11 @@ async def cat(cb: CallbackQuery):
         )])
     kb.append([InlineKeyboardButton(text="🧺 Кошик", callback_data="cart")])
     kb.append([InlineKeyboardButton(text="⬅️ Категорії", callback_data="cats")])
-    await cb.message.edit_text("\n".join(text_lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+    await cb.message.edit_text(
+        f"📦 {cat_name}:\nОберіть товар нижче (натисніть на назву).",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("prod:"))
@@ -297,9 +275,12 @@ async def prod(cb: CallbackQuery):
         "Додати в кошик?"
     )
 
-    # Щоб не плодити повідомлення — просто надсилаємо карточку товару з фото/без фото
     if item.get("photo"):
-        await cb.message.answer_photo(photo=item["photo"], caption=text, reply_markup=product_kb(sku))
+        await cb.message.answer_photo(
+            photo=item["photo"],
+            caption=text,
+            reply_markup=product_kb(sku)
+        )
     else:
         await cb.message.answer(text, reply_markup=product_kb(sku))
 
@@ -344,8 +325,8 @@ async def checkout(cb: CallbackQuery):
     await cb.message.answer("✍️ Введіть ваше ім’я:")
     await cb.answer()
 
-# flow має приймати І текст, І contact (бо contact — НЕ текст)
-@dp.message(F.text | F.contact)
+# FLOW: тільки текст (щоб фото не ламали потік)
+@dp.message(F.text)
 async def flow(m: Message):
     user_id = m.from_user.id
     if user_id not in draft:
@@ -364,11 +345,7 @@ async def flow(m: Message):
         return
 
     if step == "phone":
-        phone = ""
-        if m.contact and m.contact.phone_number:
-            phone = m.contact.phone_number
-        else:
-            phone = (m.text or "").strip()
+        phone = (m.text or "").strip()
         draft[user_id]["phone"] = phone
         draft[user_id]["step"] = "deliveryType"
         kb = ReplyKeyboardMarkup(
@@ -391,7 +368,6 @@ async def flow(m: Message):
             draft[user_id]["step"] = "address"
             await m.answer("🏠 Введіть адресу доставки:", reply_markup=main_menu_kb())
             return
-
         await m.answer("Будь ласка, натисніть кнопку: 🚚 Доставка або 🏃 Самовивіз")
         return
 
@@ -404,7 +380,7 @@ async def flow(m: Message):
     if step == "datetime":
         draft[user_id]["datetime"] = (m.text or "").strip()
         draft[user_id]["step"] = "comment"
-        await m.answer("💬 Коментар (якщо доставка Новою Поштою, то вкажіть місто та номер відділення та ваші ПІБ отримувача і телефон отримувача):")
+        await m.answer("💬 Коментар (якщо доставка Новою Поштою, то вкажіть місто, відділення, ПІБ та телефон):")
         return
 
     if step == "comment":
@@ -416,9 +392,8 @@ async def flow(m: Message):
         items: List[Dict[str, Any]] = []
         for sku, qty in carts.get(user_id, {}).items():
             it = find_item_by_sku(sku)
-            if not it:
-                continue
-            items.append({"sku": sku, "title": it["title"], "qty": qty, "price": it["price"]})
+            if it:
+                items.append({"sku": sku, "title": it["title"], "qty": qty, "price": it["price"]})
 
         total = calc_total(user_id)
 
@@ -441,9 +416,9 @@ async def flow(m: Message):
 
         draft[user_id]["items"] = items
         draft[user_id]["total"] = total
+        draft[user_id]["step"] = "confirm_wait"
 
         await m.answer("\n".join(summary), reply_markup=kb)
-        draft[user_id]["step"] = "confirm_wait"
         return
 
 @dp.callback_query(F.data == "cancel")
@@ -523,7 +498,6 @@ async def confirm(cb: CallbackQuery):
 
     carts[user_id] = {}
     draft.pop(user_id, None)
-
     await cb.answer("Готово ✅")
 
 @dp.callback_query(F.data.startswith("st:"))
@@ -533,7 +507,6 @@ async def set_status(cb: CallbackQuery):
         return
 
     _, order_id, status, user_tg_id = cb.data.split(":", 3)
-
     async with ClientSession() as session:
         res = await gs_update_status(session, order_id, status)
 
@@ -547,47 +520,54 @@ async def set_status(cb: CallbackQuery):
         await cb.answer("Помилка оновлення статусу", show_alert=True)
 
 # =========================
-# Aiohttp app + Polling runner
+# Webhook server (aiohttp)
 # =========================
-_polling_task: Optional[asyncio.Task] = None
-
 async def on_startup(app: web.Application):
-    global _polling_task
+    webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.set_webhook(
+            webhook_url,
+            allowed_updates=["message", "callback_query"]
+        )
+        print("✅ Webhook set to:", webhook_url)
+    except Exception as e:
+        # якщо set_webhook впаде — ти це побачиш в Render logs
+        print("❌ set_webhook failed:", repr(e))
 
-    # на всякий випадок — вимикаємо webhook, бо ми на polling
+async def on_shutdown(app: web.Application):
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
-
-    async def runner():
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-
-    _polling_task = asyncio.create_task(runner())
-    print("✅ Bot polling started")
-
-async def on_shutdown(app: web.Application):
-    global _polling_task
-    if _polling_task:
-        _polling_task.cancel()
-        try:
-            await _polling_task
-        except Exception:
-            pass
     await bot.session.close()
 
-async def health(_request: web.Request):
-    return web.Response(text="ok")
+async def handle_webhook(request: web.Request):
+    try:
+        update = await request.json()
+        await dp.feed_raw_update(bot, update)
+        return web.Response(text="ok")
+    except Exception as e:
+        print("Webhook handler error:", repr(e))
+        # ВАЖЛИВО: не віддаємо 500 Telegram’у
+        return web.Response(text="ok")
 
-def build_app() -> web.Application:
+def build_app():
     app = web.Application()
+
+    async def health(_request):
+        return web.Response(text="ok")
+
     app.router.add_get("/", health)
+    app.router.add_post(WEBHOOK_PATH, handle_webhook)
+
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     return app
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
