@@ -563,9 +563,26 @@ async def on_shutdown(app: web.Application):
 
 
 async def handle_webhook(request: web.Request):
-    update = await request.json()
-    await dp.feed_raw_update(bot, update)
-    return web.Response(text="ok")
+    try:
+        # Telegram sends POST JSON updates
+        if request.method != "POST":
+            return web.Response(text="ok")
+
+        # Safer JSON parsing
+        try:
+            update = await request.json()
+        except Exception as e:
+            body = await request.text()
+            print("Webhook JSON parse error:", repr(e), "Body head:", body[:200])
+            return web.Response(text="ok")
+
+        await dp.feed_raw_update(bot, update)
+        return web.Response(text="ok")
+
+    except Exception as e:
+        # Never return 500 to Telegram; log and return 200
+        print("Webhook handler error:", repr(e))
+        return web.Response(text="ok")
 
 
 def build_app():
@@ -578,6 +595,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
