@@ -198,6 +198,11 @@ def norm_text(s: Optional[str]) -> str:
     return " ".join(str(s).replace("\u00a0", " ").split()).strip()
 
 
+async def safe_typing_delay():
+    # маленька пауза, щоб зняти "burst" та зробити UX стабільнішим
+    await asyncio.sleep(0.08)
+
+
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -283,6 +288,10 @@ def lost_session_text() -> str:
     )
 
 
+def in_flow(uid: int) -> bool:
+    return uid in draft
+
+
 # =========================
 # Telegram safe wrappers
 # =========================
@@ -294,6 +303,7 @@ async def tg_call(coro, what: str = "tg_call"):
 
 
 async def safe_send(m: Message, text: str, reply_markup=None):
+    await safe_typing_delay()
     await tg_call(m.answer(text, reply_markup=reply_markup), what="message.answer")
 
 
@@ -352,7 +362,7 @@ async def gs_update_status(order_id: str, status: str) -> Dict[str, Any]:
 # =========================
 # Bot + Dispatcher
 # =========================
-tg_timeout = ClientTimeout(total=15, connect=10, sock_connect=10, sock_read=15)
+tg_timeout = ClientTimeout(total=20, connect=10, sock_connect=10, sock_read=20)
 bot = Bot(BOT_TOKEN, session=AiohttpSession(timeout=tg_timeout))
 dp = Dispatcher()
 
@@ -449,39 +459,55 @@ async def start(m: Message):
     await safe_send(m, welcome_text, reply_markup=main_menu_kb())
 
 
-# ✅ Меню: тільки точні кнопки (щоб не красти кроки оформлення)
-@dp.message(F.text)
-async def menu_router(m: Message):
-    txt = norm_text(m.text)
+# -------------------------
+# MENU BUTTONS (точно)
+# важливо: НЕ робимо catch-all F.text
+# -------------------------
+async def _warn_in_flow(m: Message) -> bool:
+    if in_flow(m.from_user.id):
+        await safe_send(m, "⚠️ Ви зараз оформлюєте замовлення. Будь ласка, завершіть крок або введіть /reset щоб почати з нуля.")
+        return True
+    return False
 
-    # якщо користувач в активному флоу — меню не чіпаємо
-    if m.from_user and m.from_user.id in draft:
+
+@dp.message(F.text == "🛒 Зробити замовлення")
+@dp.message(F.text == "📦 Каталог / Меню")
+async def show_catalog(m: Message):
+    if await _warn_in_flow(m):
         return
+    await safe_send(m, "Оберіть категорію:", reply_markup=categories_kb())
 
-    if txt in ("🛒 Зробити замовлення", "📦 Каталог / Меню"):
-        log.info("📩 menu click user=%s text=%r", m.from_user.id, txt)
-        await safe_send(m, "Оберіть категорію:", reply_markup=categories_kb())
+
+@dp.message(F.text == "🚚 Доставка та оплата")
+async def delivery(m: Message):
+    if await _warn_in_flow(m):
         return
+    await safe_send(
+        m,
+        "🚚 Доставка та оплата:\n"
+        "• Доставка по місту\n"
+        "• Самовивіз\n"
+        "Оплата: готівка/переказ (на старті)."
+    )
 
-    if txt == "🚚 Доставка та оплата":
-        await safe_send(
-            m,
-            "🚚 Доставка та оплата:\n"
-            "• Доставка по місту\n"
-            "• Самовивіз\n"
-            "Оплата: готівка/переказ (на старті)."
-        )
+
+@dp.message(F.text == "☎️ Контакти")
+async def contacts(m: Message):
+    if await _warn_in_flow(m):
         return
+    await safe_send(m, "☎️ Контакти:\nМенеджер: @ruslanshum\nТел: +380973080330")
 
-    if txt == "☎️ Контакти":
-        await safe_send(m, "☎️ Контакти:\nМенеджер: @ruslanshum\nТел: +380973080330")
+
+@dp.message(F.text == "🧾 Мої замовлення")
+async def my_orders_stub(m: Message):
+    if await _warn_in_flow(m):
         return
-
-    if txt == "🧾 Мої замовлення":
-        await safe_send(m, "🧾 Поки що в демо показ 'Мої замовлення' буде на наступному кроці.")
-        return
+    await safe_send(m, "🧾 Поки що в демо показ 'Мої замовлення' буде на наступному кроці.")
 
 
+# -------------------------
+# Inline navigation
+# -------------------------
 @dp.callback_query(F.data == "cats")
 async def cats(cb: CallbackQuery):
     await safe_edit(cb, "Оберіть категорію:", reply_markup=categories_kb())
@@ -607,7 +633,8 @@ async def flow_contact(m: Message):
 
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="🚚 Доставка"), KeyboardButton(text="🏃 Самовивіз")]],
-        resize_keyboard=True, one_time_keyboard=True
+        resize_keyboard=True,
+        one_time_keyboard=True
     )
     await safe_send(m, "Оберіть тип отримання:", reply_markup=kb)
 
@@ -629,7 +656,8 @@ async def flow(m: Message):
         await save_state("name")
         kb = ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text="📱 Поділитися контактом", request_contact=True)]],
-            resize_keyboard=True, one_time_keyboard=True
+            resize_keyboard=True,
+            one_time_keyboard=True
         )
         await safe_send(m, "📱 Надішліть телефон (кнопкою) або введіть вручну:", reply_markup=kb)
         return
@@ -640,7 +668,8 @@ async def flow(m: Message):
         await save_state("phone_text")
         kb = ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text="🚚 Доставка"), KeyboardButton(text="🏃 Самовивіз")]],
-            resize_keyboard=True, one_time_keyboard=True
+            resize_keyboard=True,
+            one_time_keyboard=True
         )
         await safe_send(m, "Оберіть тип отримання:", reply_markup=kb)
         return
@@ -651,14 +680,14 @@ async def flow(m: Message):
             draft[user_id]["address"] = "-"
             draft[user_id]["step"] = "datetime"
             await save_state("delivery_pickup")
-            await safe_send(m, "🕒 Вкажіть дату/час (наприклад: завтра 14:00):", reply_markup=main_menu_kb())
+            await safe_send(m, "🕒 Вкажіть дату/час (наприклад: завтра 14:00):")
             return
 
         if "Доставка" in text:
             draft[user_id]["deliveryType"] = "DELIVERY"
             draft[user_id]["step"] = "address"
             await save_state("delivery_delivery")
-            await safe_send(m, "🏠 Введіть адресу доставки:", reply_markup=main_menu_kb())
+            await safe_send(m, "🏠 Введіть адресу доставки:")
             return
 
         await safe_send(m, "Будь ласка, натисніть кнопку: 🚚 Доставка або 🏃 Самовивіз")
@@ -812,13 +841,14 @@ async def set_status(cb: CallbackQuery):
 
     if res.get("ok"):
         await tg_call(cb.answer(f"Статус: {status} ✅"), what="cb.answer(st_ok)")
-        await tg_call(bot.send_message(int(user_tg_id), f"📦 Статус замовлення #{order_id}: {status}"), what="notify_user_status")
+        await tg_call(bot.send_message(int(user_tg_id), f"📦 Статус замовлення #{order_id}: {status}"),
+                      what="notify_user_status")
     else:
         await tg_call(cb.answer("Помилка оновлення статусу", show_alert=True), what="cb.answer(st_err)")
 
 
 # =========================
-# Worker: process updates sequentially (NO wait_for cancellation)
+# Worker: process updates sequentially
 # =========================
 async def update_worker():
     log.info("✅ update_worker started boot_id=%s pid=%s", boot_id, process_id)
@@ -916,6 +946,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
