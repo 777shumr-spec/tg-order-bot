@@ -20,7 +20,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject
 
-# ✅ ВАЖЛИВО: правильна сесія aiogram з таймаутом (щоб НЕ робити wait_for навколо Telegram API)
+# ✅ правильна сесія aiogram з таймаутом
 from aiogram.client.session.aiohttp import AiohttpSession
 
 
@@ -105,7 +105,7 @@ update_queue: asyncio.Queue = asyncio.Queue(maxsize=UPDATE_QUEUE_MAX)
 
 
 # =========================
-# Persistent state (важливо!)
+# Persistent state
 # =========================
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 state_lock = asyncio.Lock()
@@ -162,7 +162,6 @@ async def save_state(reason: str = ""):
     async with state_lock:
         payload = _serialize_state()
         try:
-            # ✅ не блокуємо event loop файловим записом
             await asyncio.to_thread(_write_state_file, payload)
             log.info("💾 state saved (%s) carts=%d draft=%d", reason, len(carts), len(draft))
         except Exception as e:
@@ -193,6 +192,13 @@ async def load_state():
 # =========================
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def norm_text(s: Optional[str]) -> str:
+    # нормалізуємо пробіли + прибираємо невидимі штуки
+    if not s:
+        return ""
+    return " ".join(str(s).replace("\u00a0", " ").split()).strip()
 
 
 def main_menu_kb() -> ReplyKeyboardMarkup:
@@ -281,9 +287,7 @@ def lost_session_text() -> str:
 
 
 # =========================
-# Telegram API safe wrappers
-# ✅ БЕЗ wait_for! (щоб не рвати HTTP-запити посередині і не ловити Unclosed connector)
-# Таймаут тепер в AiohttpSession для Bot
+# Telegram API wrappers (без wait_for)
 # =========================
 async def tg_call(coro, what: str = "tg_call"):
     try:
@@ -312,7 +316,7 @@ async def safe_edit(cb: CallbackQuery, text: str, reply_markup=None):
 
 
 # =========================
-# GS calls (через один глобальний ClientSession)
+# GS calls (global session)
 # =========================
 gs_http: Optional[ClientSession] = None
 
@@ -321,7 +325,6 @@ async def gs_create_order(payload: Dict[str, Any]) -> Dict[str, Any]:
     global gs_http
     if gs_http is None:
         return {"ok": False, "error": "GS session not initialized"}
-
     try:
         async with gs_http.post(GS_ENDPOINT, json=payload) as resp:
             text = await resp.text()
@@ -337,7 +340,6 @@ async def gs_update_status(order_id: str, status: str) -> Dict[str, Any]:
     global gs_http
     if gs_http is None:
         return {"ok": False, "error": "GS session not initialized"}
-
     payload = {"key": GS_KEY, "action": "updateStatus", "bizId": BIZ_ID, "orderId": order_id, "status": status}
     try:
         async with gs_http.post(GS_ENDPOINT, json=payload) as resp:
@@ -353,7 +355,6 @@ async def gs_update_status(order_id: str, status: str) -> Dict[str, Any]:
 # =========================
 # Bot + Dispatcher
 # =========================
-# ✅ ставимо таймаути тут (а не через wait_for)
 tg_timeout = ClientTimeout(total=15, connect=10, sock_connect=10, sock_read=15)
 bot = Bot(BOT_TOKEN, session=AiohttpSession(timeout=tg_timeout))
 dp = Dispatcher()
@@ -380,9 +381,10 @@ async def debug_state(m: Message):
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
         return
     uid = m.from_user.id
-    d = draft.get(uid)
-    c = carts.get(uid)
-    await safe_send(m, f"DEBUG boot_id={boot_id} pid={process_id}\nuser={uid}\ndraft={d}\ncart={c}\nqueue={update_queue.qsize()}")
+    await safe_send(
+        m,
+        f"DEBUG boot_id={boot_id} pid={process_id}\nuser={uid}\ndraft={draft.get(uid)}\ncart={carts.get(uid)}\nqueue={update_queue.qsize()}"
+    )
 
 
 @dp.message(Command("ping"))
@@ -449,13 +451,18 @@ async def start(m: Message):
     await safe_send(m, welcome_text, reply_markup=main_menu_kb())
 
 
-@dp.message(F.text == "📦 Каталог / Меню")
-@dp.message(F.text == "🛒 Зробити замовлення")
+# ✅ ВАЖЛИВО: робимо кнопки НЕ по точній рівності, а по змісту
+@dp.message(F.text.contains("Зробити замовлення"))
+@dp.message(F.text.contains("Каталог"))
+@dp.message(F.text.contains("Меню"))
 async def show_catalog(m: Message):
+    txt = norm_text(m.text)
+    log.info("📩 menu click user=%s text=%r", m.from_user.id, txt)
     await safe_send(m, "Оберіть категорію:", reply_markup=categories_kb())
 
 
-@dp.message(F.text == "🚚 Доставка та оплата")
+@dp.message(F.text.contains("Доставка"))
+@dp.message(F.text.contains("оплата"))
 async def delivery(m: Message):
     await safe_send(
         m,
@@ -466,12 +473,12 @@ async def delivery(m: Message):
     )
 
 
-@dp.message(F.text == "☎️ Контакти")
+@dp.message(F.text.contains("Контакти"))
 async def contacts(m: Message):
     await safe_send(m, "☎️ Контакти:\nМенеджер: @ruslanshum\nТел: +380973080330")
 
 
-@dp.message(F.text == "🧾 Мої замовлення")
+@dp.message(F.text.contains("Мої замовлення"))
 async def my_orders_stub(m: Message):
     await safe_send(m, "🧾 Поки що в демо показ 'Мої замовлення' буде на наступному кроці.")
 
@@ -599,8 +606,6 @@ async def flow_contact(m: Message):
     draft[user_id]["step"] = "deliveryType"
     await save_state("phone_contact")
 
-    log.info("flow_contact -> step=deliveryType user=%s phone=%s", user_id, phone)
-
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="🚚 Доставка"), KeyboardButton(text="🏃 Самовивіз")]],
         resize_keyboard=True, one_time_keyboard=True
@@ -616,8 +621,8 @@ async def flow(m: Message):
         return
 
     step = draft[user_id].get("step")
-    text = (m.text or "").strip()
-    log.info("flow user=%s step=%s text=%s", user_id, step, text[:80])
+    text = norm_text(m.text)
+    log.info("flow user=%s step=%s text=%r", user_id, step, text[:120])
 
     if step == "name":
         draft[user_id]["name"] = text
@@ -802,7 +807,6 @@ async def set_status(cb: CallbackQuery):
         return
 
     _, order_id, status, user_tg_id = cb.data.split(":", 3)
-
     res = await gs_update_status(order_id, status)
 
     if res.get("ok"):
@@ -838,34 +842,32 @@ async def update_worker():
 # =========================
 # Webhook server (aiohttp)
 # =========================
-async def on_startup(app: web.Application):
+async def app_lifecycle(app: web.Application):
     global gs_http
-
     log.info("🚀 BOOT boot_id=%s pid=%s", boot_id, process_id)
+
     await load_state()
 
-    # ✅ один GS session на весь процес (без витоків)
     gs_timeout = ClientTimeout(total=25, connect=10, sock_connect=10, sock_read=25)
     gs_http = ClientSession(timeout=gs_timeout)
 
     app["worker_task"] = asyncio.create_task(update_worker())
 
-    if not WEBHOOK_BASE:
+    if WEBHOOK_BASE:
+        webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            await bot.set_webhook(webhook_url, allowed_updates=["message", "callback_query"])
+            log.info("✅ Webhook set to: %s", webhook_url)
+        except Exception as e:
+            log.exception("❌ set_webhook failed: %r", e)
+    else:
         log.warning("WEBHOOK_BASE is empty. Webhook will NOT be set.")
-        return
 
-    webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await bot.set_webhook(webhook_url, allowed_updates=["message", "callback_query"])
-        log.info("✅ Webhook set to: %s", webhook_url)
-    except Exception as e:
-        log.exception("❌ set_webhook failed: %r", e)
+    # старт
+    yield
 
-
-async def on_shutdown(app: web.Application):
-    global gs_http
-
+    # shutdown
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
@@ -879,7 +881,6 @@ async def on_shutdown(app: web.Application):
         except Exception:
             pass
 
-    # ✅ закриваємо GS session
     if gs_http is not None:
         try:
             await gs_http.close()
@@ -887,7 +888,6 @@ async def on_shutdown(app: web.Application):
             pass
         gs_http = None
 
-    # ✅ закриваємо telegram session
     try:
         await bot.session.close()
     except Exception:
@@ -917,13 +917,13 @@ def build_app():
     app.router.add_get("/", health)
     app.router.add_post(WEBHOOK_PATH, handle_webhook)
 
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
+    app.cleanup_ctx.append(app_lifecycle)
     return app
 
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
