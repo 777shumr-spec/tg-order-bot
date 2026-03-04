@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import asyncio
+import traceback
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -188,7 +190,7 @@ async def safe_edit(cb: CallbackQuery, text: str, reply_markup=None):
 
 def lost_session_text() -> str:
     return (
-        "⚠️ Сесія оформлення зникла (перезапуск сервера/сон Render).\n\n"
+        "⚠️ Сесія оформлення зникла (перезапуск сервера).\n\n"
         "Будь ласка, відкрийте 🧺 Кошик → ✅ Оформити ще раз.\n"
         "Якщо кошик теж порожній — додайте товари з каталогу."
     )
@@ -229,10 +231,22 @@ class CrashGuardMiddleware(BaseMiddleware):
         try:
             return await handler(event, data)
         except Exception as e:
-            log.exception("🔥 UNHANDLED ERROR: %r", e)
+            log.error("🔥 UNHANDLED ERROR: %r", e)
+            log.error(traceback.format_exc())
             return
 
 dp.update.middleware(CrashGuardMiddleware())
+
+
+# ---------- admin debug ----------
+@dp.message(Command("debug_state"))
+async def debug_state(m: Message):
+    if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
+        return
+    uid = m.from_user.id
+    d = draft.get(uid)
+    c = carts.get(uid)
+    await safe_send(m, f"DEBUG\nuser={uid}\ndraft={d}\ncart={c}")
 
 
 # ---------- admin file_id ----------
@@ -431,6 +445,7 @@ async def checkout(cb: CallbackQuery):
         await cb.answer("Кошик порожній", show_alert=True)
         return
     draft[cb.from_user.id] = {"step": "name"}
+    log.info("checkout -> step=name user=%s", cb.from_user.id)
     await cb.message.answer("✍️ Введіть ваше ім’я:")
     try:
         await cb.answer()
@@ -448,13 +463,13 @@ async def flow_contact(m: Message):
         return
 
     if draft[user_id].get("step") != "phone":
-        # контакт прийшов не в той момент — не мовчимо
         await safe_send(m, "ℹ️ Контакт отримано, але зараз не етап телефону. Продовжіть оформлення.", reply_markup=main_menu_kb())
         return
 
     phone = (m.contact.phone_number or "").strip()
     draft[user_id]["phone"] = phone
     draft[user_id]["step"] = "deliveryType"
+    log.info("flow_contact -> step=deliveryType user=%s phone=%s", user_id, phone)
 
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="🚚 Доставка"), KeyboardButton(text="🏃 Самовивіз")]],
@@ -473,6 +488,8 @@ async def flow(m: Message):
 
     step = draft[user_id].get("step")
     text = (m.text or "").strip()
+
+    log.info("flow user=%s step=%s text=%s", user_id, step, text[:80])
 
     if step == "name":
         draft[user_id]["name"] = text
@@ -700,15 +717,27 @@ async def on_shutdown(app: web.Application):
         pass
     await bot.session.close()
 
+async def _process_update(update: dict):
+    try:
+        await dp.feed_raw_update(bot, update)
+    except Exception as e:
+        log.error("🔥 feed_raw_update failed: %r", e)
+        log.error(traceback.format_exc())
+
 async def handle_webhook(request: web.Request):
+    """
+    ПРОД: Відповідаємо Telegram МИТТЄВО (200 OK),
+    а обробку апдейту робимо у background task.
+    Це прибирає “зависання” через довгу обробку/таймаути.
+    """
     try:
         update = await request.json()
-        await dp.feed_raw_update(bot, update)
+    except Exception:
         return web.Response(text="ok")
-    except Exception as e:
-        log.exception("Webhook handler error: %r", e)
-        # важливо: не віддавати 500 Telegram
-        return web.Response(text="ok")
+
+    # не блокуємо HTTP-відповідь
+    asyncio.create_task(_process_update(update))
+    return web.Response(text="ok")
 
 def build_app():
     app = web.Application()
@@ -725,6 +754,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
