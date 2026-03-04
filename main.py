@@ -776,14 +776,15 @@ async def cancel(cb: CallbackQuery):
     await safe_edit(cb, "❌ Замовлення скасовано.")
     await tg_call(cb.answer(), what="cb.answer(cancel)")
 
-await tg_call(
-    bot.send_message(
-        chat_id=cb.from_user.id,
-        text="Ок. Щоб почати заново — натисніть 🛒 Зробити замовлення або 📦 Каталог / Меню.",
-        reply_markup=main_menu_kb()
-    ),
-    what="post_cancel_main_menu"
-)
+    # ✅ ПОКАЗАТИ ГОЛОВНЕ МЕНЮ після cancel (всередині хендлера!)
+    await tg_call(
+        cb.message.answer(
+            "Ок. Щоб почати заново — натисніть 🛒 Зробити замовлення або 📦 Каталог / Меню.",
+            reply_markup=main_menu_kb()
+        ),
+        what="post_cancel_main_menu"
+    )
+
 
 @dp.callback_query(F.data == "confirm")
 async def confirm(cb: CallbackQuery):
@@ -837,14 +838,17 @@ async def confirm(cb: CallbackQuery):
 
     order_id = str(res.get("orderId", ""))
     await safe_edit(cb, f"🎉 Дякуємо! Замовлення прийнято.\nНомер: #{order_id}\nМенеджер скоро зв’яжеться.")
-await tg_call(
-    bot.send_message(
-        chat_id=user_id,
-        text="✅ Якщо бажаєте зробити наступне замовлення — натисніть 🛒 Зробити замовлення або відкрийте 📦 Каталог / Меню.",
-        reply_markup=main_menu_kb()
-    ),
-    what="post_confirm_main_menu"
-)
+
+    # ✅ ПОКАЗАТИ ГОЛОВНЕ МЕНЮ після успішного confirm (всередині хендлера!)
+    await tg_call(
+        bot.send_message(
+            chat_id=user_id,
+            text="✅ Якщо бажаєте зробити наступне замовлення — натисніть 🛒 Зробити замовлення або відкрийте 📦 Каталог / Меню.",
+            reply_markup=main_menu_kb()
+        ),
+        what="post_confirm_main_menu"
+    )
+
     mgr_text = [
         f"🆕 НОВЕ ЗАМОВЛЕННЯ #{order_id}",
         f"Ім’я: {d.get('name','')}",
@@ -1032,6 +1036,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
