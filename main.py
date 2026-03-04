@@ -1,9 +1,10 @@
 import os
 import json
+import logging
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
-from aiohttp import web, ClientSession
+from aiohttp import web, ClientSession, ClientTimeout
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery,
@@ -11,6 +12,19 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 from aiogram.filters import CommandStart, Command
+from aiogram import BaseMiddleware
+from aiogram.types import TelegramObject
+
+
+# =========================
+# LOGGING (Render-friendly)
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("tg-order-bot")
+
 
 # =========================
 # ENV
@@ -25,9 +39,6 @@ BIZ_ID = os.getenv("BIZ_ID", "demo").strip()
 CURRENCY = os.getenv("CURRENCY", "UAH").strip()
 SOURCE = os.getenv("SOURCE", "Telegram").strip()
 
-# WEBHOOK_BASE:
-# 1) WEBHOOK_BASE
-# 2) або Render дає RENDER_EXTERNAL_URL
 WEBHOOK_BASE = (os.getenv("WEBHOOK_BASE", "").strip() or os.getenv("RENDER_EXTERNAL_URL", "").strip())
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
 PORT = int((os.getenv("PORT", "10000") or "10000"))
@@ -43,9 +54,9 @@ if not GS_KEY:
 if MANAGER_CHAT_ID == 0:
     raise RuntimeError("MANAGER_CHAT_ID is required")
 
+
 # =========================
-# Catalog
-# ВАЖЛИВО: file_id треба ОНОВИТИ для нового бота!
+# Catalog (file_id під твого нового бота)
 # =========================
 CATALOG = {
     "Десерти": [
@@ -68,12 +79,14 @@ CATALOG = {
     ],
 }
 
+
 # =========================
-# State (RAM)
+# State (RAM) — може скидатися при рестарті
 # =========================
 carts: Dict[int, Dict[str, int]] = {}
 draft: Dict[int, Dict[str, Any]] = {}
 fileid_mode: Dict[int, bool] = {}
+
 
 # =========================
 # Helpers
@@ -150,30 +163,13 @@ def cart_text(user_id: int) -> str:
     lines.append(f"\nРазом: {calc_total(user_id)} {CURRENCY}")
     return "\n".join(lines)
 
-async def gs_create_order(session: ClientSession, payload: Dict[str, Any]) -> Dict[str, Any]:
-    async with session.post(GS_ENDPOINT, json=payload, timeout=20) as resp:
-        text = await resp.text()
-        try:
-            return json.loads(text)
-        except Exception:
-            return {"ok": False, "error": f"Bad response: {text[:200]}"}
-
-async def gs_update_status(session: ClientSession, order_id: str, status: str) -> Dict[str, Any]:
-    payload = {"key": GS_KEY, "action": "updateStatus", "bizId": BIZ_ID, "orderId": order_id, "status": status}
-    async with session.post(GS_ENDPOINT, json=payload, timeout=20) as resp:
-        text = await resp.text()
-        try:
-            return json.loads(text)
-        except Exception:
-            return {"ok": False, "error": f"Bad response: {text[:200]}"}
+async def safe_send(m: Message, text: str, reply_markup=None):
+    try:
+        await m.answer(text, reply_markup=reply_markup)
+    except Exception as e:
+        log.warning("safe_send failed: %r", e)
 
 async def safe_edit(cb: CallbackQuery, text: str, reply_markup=None):
-    """
-    Безпечне редагування:
-    - якщо message текстова -> edit_text
-    - якщо message з фото/медіа -> edit_caption
-    - якщо не вийшло -> відправляємо нове повідомлення
-    """
     msg = cb.message
     try:
         if msg.text is not None:
@@ -183,12 +179,43 @@ async def safe_edit(cb: CallbackQuery, text: str, reply_markup=None):
             await msg.edit_caption(caption=text, reply_markup=reply_markup)
             return
     except Exception as e:
-        print("safe_edit failed:", repr(e))
+        log.warning("safe_edit failed: %r", e)
 
     try:
         await msg.answer(text, reply_markup=reply_markup)
     except Exception as e:
-        print("safe_edit fallback send failed:", repr(e))
+        log.warning("safe_edit fallback send failed: %r", e)
+
+def lost_session_text() -> str:
+    return (
+        "⚠️ Сесія оформлення зникла (перезапуск сервера/сон Render).\n\n"
+        "Будь ласка, відкрийте 🧺 Кошик → ✅ Оформити ще раз.\n"
+        "Якщо кошик теж порожній — додайте товари з каталогу."
+    )
+
+async def gs_create_order(session: ClientSession, payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        async with session.post(GS_ENDPOINT, json=payload) as resp:
+            text = await resp.text()
+            try:
+                return json.loads(text)
+            except Exception:
+                return {"ok": False, "error": f"Bad response: {text[:200]}"}
+    except Exception as e:
+        return {"ok": False, "error": f"GS request failed: {repr(e)}"}
+
+async def gs_update_status(session: ClientSession, order_id: str, status: str) -> Dict[str, Any]:
+    payload = {"key": GS_KEY, "action": "updateStatus", "bizId": BIZ_ID, "orderId": order_id, "status": status}
+    try:
+        async with session.post(GS_ENDPOINT, json=payload) as resp:
+            text = await resp.text()
+            try:
+                return json.loads(text)
+            except Exception:
+                return {"ok": False, "error": f"Bad response: {text[:200]}"}
+    except Exception as e:
+        return {"ok": False, "error": f"GS request failed: {repr(e)}"}
+
 
 # =========================
 # Bot + Dispatcher
@@ -196,18 +223,17 @@ async def safe_edit(cb: CallbackQuery, text: str, reply_markup=None):
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-from aiogram import BaseMiddleware
-from aiogram.types import TelegramObject
 
 class CrashGuardMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: TelegramObject, data: dict):
         try:
             return await handler(event, data)
         except Exception as e:
-            print("🔥 UNHANDLED ERROR:", repr(e))
+            log.exception("🔥 UNHANDLED ERROR: %r", e)
             return
 
 dp.update.middleware(CrashGuardMiddleware())
+
 
 # ---------- admin file_id ----------
 @dp.message(Command("fileid"))
@@ -215,7 +241,8 @@ async def fileid_help(m: Message):
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
         return
     fileid_mode[m.from_user.id] = True
-    await m.answer(
+    await safe_send(
+        m,
         "✅ Режим file_id увімкнено.\n"
         "Надішли 1 фото як повідомлення (не файлом). Я відповім file_id.\n"
         "Щоб вимкнути — /fileidoff"
@@ -226,7 +253,7 @@ async def fileid_off(m: Message):
     if ADMIN_IDS and m.from_user.id not in ADMIN_IDS:
         return
     fileid_mode[m.from_user.id] = False
-    await m.answer("✅ Режим file_id вимкнено.")
+    await safe_send(m, "✅ Режим file_id вимкнено.")
 
 @dp.message(F.photo)
 async def fileid_photo(m: Message):
@@ -235,12 +262,13 @@ async def fileid_photo(m: Message):
     if not fileid_mode.get(m.from_user.id, False):
         return
     photo = m.photo[-1]
-    await m.answer(f"✅ file_id:\n{photo.file_id}")
+    await safe_send(m, f"✅ file_id:\n{photo.file_id}")
+
 
 # ---------- main bot ----------
 @dp.message(Command("ping"))
 async def ping(m: Message):
-    await m.answer("pong ✅")
+    await safe_send(m, "pong ✅")
 
 @dp.message(CommandStart())
 async def start(m: Message):
@@ -250,16 +278,17 @@ async def start(m: Message):
         "Менеджер одразу підтвердить замовлення.\n\n"
         "Оберіть дію нижче 👇"
     )
-    await m.answer(welcome_text, reply_markup=main_menu_kb())
+    await safe_send(m, welcome_text, reply_markup=main_menu_kb())
 
 @dp.message(F.text == "📦 Каталог / Меню")
 @dp.message(F.text == "🛒 Зробити замовлення")
 async def show_catalog(m: Message):
-    await m.answer("Оберіть категорію:", reply_markup=categories_kb())
+    await safe_send(m, "Оберіть категорію:", reply_markup=categories_kb())
 
 @dp.message(F.text == "🚚 Доставка та оплата")
 async def delivery(m: Message):
-    await m.answer(
+    await safe_send(
+        m,
         "🚚 Доставка та оплата:\n"
         "• Доставка по місту\n"
         "• Самовивіз\n"
@@ -268,16 +297,21 @@ async def delivery(m: Message):
 
 @dp.message(F.text == "☎️ Контакти")
 async def contacts(m: Message):
-    await m.answer("☎️ Контакти:\nМенеджер: @ruslanshum\nТел: +380973080330")
+    await safe_send(m, "☎️ Контакти:\nМенеджер: @ruslanshum\nТел: +380973080330")
 
 @dp.message(F.text == "🧾 Мої замовлення")
 async def my_orders_stub(m: Message):
-    await m.answer("🧾 Поки що в демо показ 'Мої замовлення' буде на наступному кроці.")
+    await safe_send(m, "🧾 Поки що в демо показ 'Мої замовлення' буде на наступному кроці.")
+
 
 @dp.callback_query(F.data == "cats")
 async def cats(cb: CallbackQuery):
     await safe_edit(cb, "Оберіть категорію:", reply_markup=categories_kb())
-    await cb.answer()
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
 
 @dp.callback_query(F.data.startswith("cat:"))
 async def cat(cb: CallbackQuery):
@@ -297,7 +331,11 @@ async def cat(cb: CallbackQuery):
         f"📦 {cat_name}:\nОберіть товар нижче (натисніть на назву).",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
     )
-    await cb.answer()
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
 
 @dp.callback_query(F.data.startswith("prod:"))
 async def prod(cb: CallbackQuery):
@@ -316,7 +354,6 @@ async def prod(cb: CallbackQuery):
 
     try:
         photo_id = (item.get("photo") or "").strip()
-
         if photo_id:
             try:
                 await cb.message.answer_photo(
@@ -325,36 +362,30 @@ async def prod(cb: CallbackQuery):
                     reply_markup=product_kb(sku)
                 )
             except Exception as e:
-                print("answer_photo failed:", repr(e))
+                log.warning("answer_photo failed (sku=%s): %r", sku, e)
                 await cb.message.answer(
-                    text + "\n\n⚠️ Фото тимчасово недоступне (file_id).",
+                    text + "\n\n⚠️ Фото тимчасово недоступне.",
                     reply_markup=product_kb(sku)
                 )
         else:
             await cb.message.answer(text, reply_markup=product_kb(sku))
-
-    except Exception as e:
-        print("prod handler failed:", repr(e))
-        try:
-            await cb.message.answer(
-                "⚠️ Сталась технічна помилка при показі товару. Спробуйте ще раз.",
-                reply_markup=product_kb(sku)
-            )
-        except Exception:
-            pass
-
     finally:
         try:
             await cb.answer()
         except Exception:
             pass
 
+
 @dp.callback_query(F.data.startswith("add:"))
 async def add(cb: CallbackQuery):
     sku = cb.data.split(":", 1)[1]
     carts.setdefault(cb.from_user.id, {})
     carts[cb.from_user.id][sku] = carts[cb.from_user.id].get(sku, 0) + 1
-    await cb.answer("Додано ✅")
+    try:
+        await cb.answer("Додано ✅")
+    except Exception:
+        pass
+
 
 @dp.callback_query(F.data.startswith("rem:"))
 async def rem(cb: CallbackQuery):
@@ -363,21 +394,36 @@ async def rem(cb: CallbackQuery):
         carts[cb.from_user.id][sku] -= 1
         if carts[cb.from_user.id][sku] <= 0:
             del carts[cb.from_user.id][sku]
-        await cb.answer("Забрано ✅")
+        try:
+            await cb.answer("Забрано ✅")
+        except Exception:
+            pass
     else:
-        await cb.answer("У кошику немає", show_alert=False)
+        try:
+            await cb.answer("У кошику немає", show_alert=False)
+        except Exception:
+            pass
+
 
 @dp.callback_query(F.data == "cart")
 async def cart(cb: CallbackQuery):
     await safe_edit(cb, cart_text(cb.from_user.id), reply_markup=cart_kb())
-    await cb.answer()
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
 
 @dp.callback_query(F.data == "clear")
 async def clear(cb: CallbackQuery):
     carts[cb.from_user.id] = {}
     draft.pop(cb.from_user.id, None)
     await safe_edit(cb, "🧺 Кошик очищено.", reply_markup=categories_kb())
-    await cb.answer()
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
 
 @dp.callback_query(F.data == "checkout")
 async def checkout(cb: CallbackQuery):
@@ -386,138 +432,149 @@ async def checkout(cb: CallbackQuery):
         return
     draft[cb.from_user.id] = {"step": "name"}
     await cb.message.answer("✍️ Введіть ваше ім’я:")
-    await cb.answer()
+    try:
+        await cb.answer()
+    except Exception:
+        pass
 
-# --- phone via contact (ВАЖЛИВО) ---
+
+# --- phone via contact (важливо) ---
 @dp.message(F.contact)
 async def flow_contact(m: Message):
     user_id = m.from_user.id
+
     if user_id not in draft:
+        await safe_send(m, lost_session_text(), reply_markup=main_menu_kb())
         return
+
     if draft[user_id].get("step") != "phone":
+        # контакт прийшов не в той момент — не мовчимо
+        await safe_send(m, "ℹ️ Контакт отримано, але зараз не етап телефону. Продовжіть оформлення.", reply_markup=main_menu_kb())
         return
 
     phone = (m.contact.phone_number or "").strip()
     draft[user_id]["phone"] = phone
     draft[user_id]["step"] = "deliveryType"
+
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="🚚 Доставка"), KeyboardButton(text="🏃 Самовивіз")]],
         resize_keyboard=True, one_time_keyboard=True
     )
-    await m.answer("Оберіть тип отримання:", reply_markup=kb)
+    await safe_send(m, "Оберіть тип отримання:", reply_markup=kb)
 
-# FLOW: тільки текст (PROD: не зависає, логить помилки)
+
+# FLOW: тільки текст
 @dp.message(F.text)
 async def flow(m: Message):
     user_id = m.from_user.id
+
     if user_id not in draft:
         return
 
-    try:
-        step = draft[user_id].get("step")
-        txt = (m.text or "").strip()
+    step = draft[user_id].get("step")
+    text = (m.text or "").strip()
 
-        if step == "name":
-            draft[user_id]["name"] = txt
-            draft[user_id]["step"] = "phone"
-            kb = ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="📱 Поділитися контактом", request_contact=True)]],
-                resize_keyboard=True, one_time_keyboard=True
-            )
-            await m.answer("📱 Надішліть телефон (кнопкою) або введіть вручну:", reply_markup=kb)
-            return
+    if step == "name":
+        draft[user_id]["name"] = text
+        draft[user_id]["step"] = "phone"
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="📱 Поділитися контактом", request_contact=True)]],
+            resize_keyboard=True, one_time_keyboard=True
+        )
+        await safe_send(m, "📱 Надішліть телефон (кнопкою) або введіть вручну:", reply_markup=kb)
+        return
 
-        if step == "phone":
-            draft[user_id]["phone"] = txt
-            draft[user_id]["step"] = "deliveryType"
-            kb = ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="🚚 Доставка"), KeyboardButton(text="🏃 Самовивіз")]],
-                resize_keyboard=True, one_time_keyboard=True
-            )
-            await m.answer("Оберіть тип отримання:", reply_markup=kb)
-            return
+    if step == "phone":
+        draft[user_id]["phone"] = text
+        draft[user_id]["step"] = "deliveryType"
+        kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="🚚 Доставка"), KeyboardButton(text="🏃 Самовивіз")]],
+            resize_keyboard=True, one_time_keyboard=True
+        )
+        await safe_send(m, "Оберіть тип отримання:", reply_markup=kb)
+        return
 
-        if step == "deliveryType":
-            if "Самовивіз" in txt:
-                draft[user_id]["deliveryType"] = "PICKUP"
-                draft[user_id]["address"] = "-"
-                draft[user_id]["step"] = "datetime"
-                await m.answer("🕒 Вкажіть дату/час (наприклад: завтра 14:00):", reply_markup=main_menu_kb())
-                return
-
-            if "Доставка" in txt:
-                draft[user_id]["deliveryType"] = "DELIVERY"
-                draft[user_id]["step"] = "address"
-                await m.answer("🏠 Введіть адресу доставки:", reply_markup=main_menu_kb())
-                return
-
-            await m.answer("Будь ласка, натисніть кнопку: 🚚 Доставка або 🏃 Самовивіз")
-            return
-
-        if step == "address":
-            draft[user_id]["address"] = txt
+    if step == "deliveryType":
+        if "Самовивіз" in text:
+            draft[user_id]["deliveryType"] = "PICKUP"
+            draft[user_id]["address"] = "-"
             draft[user_id]["step"] = "datetime"
-            await m.answer("🕒 Вкажіть дату/час (наприклад: сьогодні 19:30):")
+            await safe_send(m, "🕒 Вкажіть дату/час (наприклад: завтра 14:00):", reply_markup=main_menu_kb())
             return
-
-        if step == "datetime":
-            draft[user_id]["datetime"] = txt
-            draft[user_id]["step"] = "comment"
-            await m.answer("💬 Коментар (якщо НП — місто, відділення, ПІБ, телефон):")
+        if "Доставка" in text:
+            draft[user_id]["deliveryType"] = "DELIVERY"
+            draft[user_id]["step"] = "address"
+            await safe_send(m, "🏠 Введіть адресу доставки:", reply_markup=main_menu_kb())
             return
+        await safe_send(m, "Будь ласка, натисніть кнопку: 🚚 Доставка або 🏃 Самовивіз")
+        return
 
-        if step == "comment":
-            comment = txt
-            if comment == "-":
-                comment = ""
-            draft[user_id]["comment"] = comment
+    if step == "address":
+        draft[user_id]["address"] = text
+        draft[user_id]["step"] = "datetime"
+        await safe_send(m, "🕒 Вкажіть дату/час (наприклад: сьогодні 19:30):")
+        return
 
-            items: List[Dict[str, Any]] = []
-            for sku, qty in carts.get(user_id, {}).items():
-                it = find_item_by_sku(sku)
-                if it:
-                    items.append({"sku": sku, "title": it["title"], "qty": qty, "price": it["price"]})
+    if step == "datetime":
+        draft[user_id]["datetime"] = text
+        draft[user_id]["step"] = "comment"
+        await safe_send(m, "💬 Коментар (якщо НП — місто, відділення, ПІБ, телефон):")
+        return
 
-            total = calc_total(user_id)
+    if step == "comment":
+        comment = text
+        if comment == "-":
+            comment = ""
+        draft[user_id]["comment"] = comment
 
-            summary = [
-                "✅ Перевірте замовлення:",
-                cart_text(user_id),
-                "",
-                f"Ім’я: {draft[user_id]['name']}",
-                f"Телефон: {draft[user_id]['phone']}",
-                f"Тип: {draft[user_id]['deliveryType']}",
-                f"Адреса: {draft[user_id].get('address','-')}",
-                f"Дата/час: {draft[user_id]['datetime']}",
-                f"Коментар: {draft[user_id]['comment'] or '-'}",
-            ]
+        items: List[Dict[str, Any]] = []
+        for sku, qty in carts.get(user_id, {}).items():
+            it = find_item_by_sku(sku)
+            if it:
+                items.append({"sku": sku, "title": it["title"], "qty": qty, "price": it["price"]})
 
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Підтвердити", callback_data="confirm")],
-                [InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel")]
-            ])
+        total = calc_total(user_id)
 
-            draft[user_id]["items"] = items
-            draft[user_id]["total"] = total
-            draft[user_id]["step"] = "confirm_wait"
+        summary = [
+            "✅ Перевірте замовлення:",
+            cart_text(user_id),
+            "",
+            f"Ім’я: {draft[user_id].get('name','')}",
+            f"Телефон: {draft[user_id].get('phone','')}",
+            f"Тип: {draft[user_id].get('deliveryType','')}",
+            f"Адреса: {draft[user_id].get('address','-')}",
+            f"Дата/час: {draft[user_id].get('datetime','')}",
+            f"Коментар: {draft[user_id].get('comment','') or '-'}",
+        ]
 
-            await m.answer("\n".join(summary), reply_markup=kb)
-            return
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Підтвердити", callback_data="confirm")],
+            [InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel")]
+        ])
 
-    except Exception as e:
-        print("FLOW ERROR:", repr(e), "step=", draft.get(user_id, {}).get("step"))
-        await m.answer("⚠️ Сталась технічна помилка. Спробуйте ще раз або /start.")
+        draft[user_id]["items"] = items
+        draft[user_id]["total"] = total
+        draft[user_id]["step"] = "confirm_wait"
+
+        await safe_send(m, "\n".join(summary), reply_markup=kb)
+        return
+
 
 @dp.callback_query(F.data == "cancel")
 async def cancel(cb: CallbackQuery):
     carts[cb.from_user.id] = {}
     draft.pop(cb.from_user.id, None)
     await safe_edit(cb, "❌ Замовлення скасовано.")
-    await cb.answer()
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
 
 @dp.callback_query(F.data == "confirm")
 async def confirm(cb: CallbackQuery):
     user_id = cb.from_user.id
+
     if user_id not in draft or not carts.get(user_id):
         await cb.answer("Немає активного замовлення", show_alert=True)
         return
@@ -549,17 +606,24 @@ async def confirm(cb: CallbackQuery):
         }
     }
 
-    async with ClientSession() as session:
+    timeout = ClientTimeout(total=25)
+    async with ClientSession(timeout=timeout) as session:
         res = await gs_create_order(session, order_payload)
 
     if not res.get("ok"):
         await cb.message.answer(f"❌ Помилка збереження замовлення.\n{res}")
-        await cb.answer()
+        try:
+            await cb.answer()
+        except Exception:
+            pass
         return
 
     order_id = str(res.get("orderId", ""))
     await safe_edit(cb, f"🎉 Дякуємо! Замовлення прийнято.\nНомер: #{order_id}\nМенеджер скоро зв’яжеться.")
-    await cb.answer("Готово ✅")
+    try:
+        await cb.answer("Готово ✅")
+    except Exception:
+        pass
 
     mgr_text = [
         f"🆕 НОВЕ ЗАМОВЛЕННЯ #{order_id}",
@@ -578,14 +642,18 @@ async def confirm(cb: CallbackQuery):
     mgr_text.append(f"\nРазом: {total} {CURRENCY}")
     mgr_text.append(f"Час: {now_str()}")
 
-    await bot.send_message(
-        chat_id=MANAGER_CHAT_ID,
-        text="\n".join(mgr_text),
-        reply_markup=manager_status_kb(order_id, str(user_id))
-    )
+    try:
+        await bot.send_message(
+            chat_id=MANAGER_CHAT_ID,
+            text="\n".join(mgr_text),
+            reply_markup=manager_status_kb(order_id, str(user_id))
+        )
+    except Exception as e:
+        log.warning("send_message to manager failed: %r", e)
 
     carts[user_id] = {}
     draft.pop(user_id, None)
+
 
 @dp.callback_query(F.data.startswith("st:"))
 async def set_status(cb: CallbackQuery):
@@ -594,7 +662,9 @@ async def set_status(cb: CallbackQuery):
         return
 
     _, order_id, status, user_tg_id = cb.data.split(":", 3)
-    async with ClientSession() as session:
+
+    timeout = ClientTimeout(total=25)
+    async with ClientSession(timeout=timeout) as session:
         res = await gs_update_status(session, order_id, status)
 
     if res.get("ok"):
@@ -606,21 +676,22 @@ async def set_status(cb: CallbackQuery):
     else:
         await cb.answer("Помилка оновлення статусу", show_alert=True)
 
+
 # =========================
 # Webhook server (aiohttp)
 # =========================
 async def on_startup(app: web.Application):
     if not WEBHOOK_BASE:
-        print("⚠️ WEBHOOK_BASE is empty. Webhook will NOT be set.")
+        log.warning("WEBHOOK_BASE is empty. Webhook will NOT be set.")
         return
 
     webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.set_webhook(webhook_url, allowed_updates=["message", "callback_query"])
-        print("✅ Webhook set to:", webhook_url)
+        log.info("✅ Webhook set to: %s", webhook_url)
     except Exception as e:
-        print("❌ set_webhook failed:", repr(e))
+        log.exception("❌ set_webhook failed: %r", e)
 
 async def on_shutdown(app: web.Application):
     try:
@@ -635,7 +706,8 @@ async def handle_webhook(request: web.Request):
         await dp.feed_raw_update(bot, update)
         return web.Response(text="ok")
     except Exception as e:
-        print("Webhook handler error:", repr(e))
+        log.exception("Webhook handler error: %r", e)
+        # важливо: не віддавати 500 Telegram
         return web.Response(text="ok")
 
 def build_app():
