@@ -61,21 +61,21 @@ if MANAGER_CHAT_ID == 0:
 CATALOG = {
     "Десерти": [
         {"sku": "cake_napoleon", "title": "Торт «Наполеон»", "price": 650,
-         "photo": "AgACAgIAAxkBAAMJaacc9kpUc_EdvU-XfbkjQCWa01AAApkWaxv08DlJ2rkz1l29lGMBAAMCAANtAAM6BA"},
+         "photo": "AgACAgIAAxkBAAMHaagCWmo_c_YK4YRk5llKms4gd5MAAmEUaxvf1kFJr4WH6F_jZ_YBAAMCAANtAAM6BA"},
         {"sku": "cake_honey", "title": "Торт «Медовик»", "price": 620,
-         "photo": "AgACAgIAAxkBAAMOaacc9hZjaZmtsgABTRYPx7fO4-INAAKdFmsb9PA5SUrTu3KAaDU3AQADAgADbQADOgQ"},
+         "photo": "AgACAgIAAxkBAAMJaagCZA-gL42QRDl6OvKYS399bb8AAmIUaxvf1kFJMk5lUqSqMKYBAAMCAANtAAM6BA"},
         {"sku": "cupcake", "title": "Капкейки (1 шт)", "price": 55,
-         "photo": "AgACAgIAAxkBAAMLaacc9jxet-_eGtSH9Fj8GM5c3scAApsWaxv08DlJtn65zZ4ErawBAAMCAAN5AAM6BA"},
+         "photo": "AgACAgIAAxkBAAMLaagCaUlnH66fW90ivi4WoagV48QAAmQUaxvf1kFJJql135zQU8gBAAMCAAN5AAM6BA"},
     ],
     "Напої": [
         {"sku": "coffee", "title": "Кава", "price": 60,
-         "photo": "AgACAgIAAxkBAAMNaacc9tuWNOYqH00S2qaMEhltcoMAAp4Waxv08DlJuR82ZcifkGUBAAMCAAN4AAM6BA"},
+         "photo": "AgACAgIAAxkBAAMNaagCbRZCO8cFb1ZEzUQd8PwYcDkAAmUUaxvf1kFJF2S_0uLiApMBAAMCAAN4AAM6BA"},
         {"sku": "tea", "title": "Чай", "price": 40,
-         "photo": "AgACAgIAAxkBAAMMaacc9le1Sejata1aqhn_GQvx4bQAApwWaxv08DlJ5dFeV8JBjI4BAAMCAAN5AAM6BA"},
+         "photo": "AgACAgIAAxkBAAMPaagCcL_xVc5L4W67KjQmOuOBggYAAmYUaxvf1kFJZLj7jsw7_5sBAAMCAAN5AAM6BA"},
     ],
     "Інше": [
         {"sku": "gift_box", "title": "Подарункова коробка", "price": 80,
-         "photo": "AgACAgIAAxkBAAMKaacc9hvdBT4ZNNG0kvk0l3ZrKzwAApoWaxv08DlJC4iaj3_p03EBAAMCAAN4AAM6BA"},
+         "photo": "AgACAgIAAxkBAAMRaagCdB_y-QfBwFl_9LLiQPrO_SIAAmcUaxvf1kFJhZ7nhJhjw9ABAAMCAAN4AAM6BA"},
     ],
 }
 
@@ -725,6 +725,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
