@@ -96,10 +96,39 @@ fileid_mode: Dict[int, bool] = {}
 
 
 # =========================
-# Queue (Webhook -> worker)
+# Queue (Webhook -> workers)
 # =========================
 UPDATE_QUEUE_MAX = 2000
 update_queue: asyncio.Queue = asyncio.Queue(maxsize=UPDATE_QUEUE_MAX)
+
+# concurrency controls
+WORKERS = int(os.getenv("WORKERS", "4"))
+MAX_INFLIGHT = int(os.getenv("MAX_INFLIGHT", "50"))
+inflight_sem = asyncio.Semaphore(MAX_INFLIGHT)
+
+_user_locks: Dict[int, asyncio.Lock] = {}
+_user_locks_guard = asyncio.Lock()
+
+
+async def _get_user_lock(uid: int) -> asyncio.Lock:
+    async with _user_locks_guard:
+        lk = _user_locks.get(uid)
+        if lk is None:
+            lk = asyncio.Lock()
+            _user_locks[uid] = lk
+        return lk
+
+
+def _extract_uid_from_update(upd: Dict[str, Any]) -> int:
+    # minimal & safe extraction for per-user ordering
+    try:
+        if "message" in upd and upd["message"] and "from" in upd["message"]:
+            return int(upd["message"]["from"]["id"])
+        if "callback_query" in upd and upd["callback_query"] and "from" in upd["callback_query"]:
+            return int(upd["callback_query"]["from"]["id"])
+    except Exception:
+        pass
+    return 0
 
 
 # =========================
@@ -199,7 +228,6 @@ def norm_text(s: Optional[str]) -> str:
 
 
 async def safe_typing_delay():
-    # маленька пауза, щоб зняти "burst" та зробити UX стабільнішим
     await asyncio.sleep(0.08)
 
 
@@ -391,7 +419,8 @@ async def debug_state(m: Message):
     await safe_send(
         m,
         f"DEBUG boot_id={boot_id} pid={process_id}\nuser={uid}\n"
-        f"draft={draft.get(uid)}\ncart={carts.get(uid)}\nqueue={update_queue.qsize()}"
+        f"draft={draft.get(uid)}\ncart={carts.get(uid)}\nqueue={update_queue.qsize()}\n"
+        f"workers={WORKERS} inflight_limit={MAX_INFLIGHT}"
     )
 
 
@@ -461,7 +490,6 @@ async def start(m: Message):
 
 # -------------------------
 # MENU BUTTONS (точно)
-# важливо: НЕ робимо catch-all F.text
 # -------------------------
 async def _warn_in_flow(m: Message) -> bool:
     if in_flow(m.from_user.id):
@@ -761,6 +789,15 @@ async def confirm(cb: CallbackQuery):
         await tg_call(cb.answer("Немає активного замовлення", show_alert=True), what="cb.answer(confirm_noactive)")
         return
 
+    # анти-дубль натискання
+    if draft[user_id].get("_confirming"):
+        await tg_call(cb.answer("⏳ Уже зберігаю...", show_alert=False), what="cb.answer(confirm_busy)")
+        return
+    draft[user_id]["_confirming"] = True
+    await save_state("confirm_pressed")
+
+    await tg_call(cb.answer("⏳ Зберігаю...", show_alert=False), what="cb.answer(confirm_progress)")
+
     d = draft[user_id]
     items = d.get("items", [])
     total = d.get("total", 0)
@@ -791,13 +828,14 @@ async def confirm(cb: CallbackQuery):
     res = await gs_create_order(order_payload)
 
     if not res.get("ok"):
+        # прибираємо флаг, щоб користувач міг повторити
+        draft[user_id]["_confirming"] = False
+        await save_state("confirm_gs_error")
         await tg_call(cb.message.answer(f"❌ Помилка збереження замовлення.\n{res}"), what="send_gs_error")
-        await tg_call(cb.answer(), what="cb.answer(confirm_err)")
         return
 
     order_id = str(res.get("orderId", ""))
     await safe_edit(cb, f"🎉 Дякуємо! Замовлення прийнято.\nНомер: #{order_id}\nМенеджер скоро зв’яжеться.")
-    await tg_call(cb.answer("Готово ✅"), what="cb.answer(confirm_ok)")
 
     mgr_text = [
         f"🆕 НОВЕ ЗАМОВЛЕННЯ #{order_id}",
@@ -848,73 +886,96 @@ async def set_status(cb: CallbackQuery):
 
 
 # =========================
-# Worker: process updates sequentially
+# Workers: process updates (parallel per user, ordered within user)
 # =========================
-async def update_worker():
-    log.info("✅ update_worker started boot_id=%s pid=%s", boot_id, process_id)
+async def _handle_one_update(upd: Dict[str, Any]):
+    uid = _extract_uid_from_update(upd)
+    lk = await _get_user_lock(uid) if uid else None
+
+    async with inflight_sem:
+        if lk:
+            async with lk:
+                await dp.feed_raw_update(bot, upd)
+        else:
+            await dp.feed_raw_update(bot, upd)
+
+
+async def update_worker(worker_id: int):
+    log.info("✅ update_worker[%s] started boot_id=%s pid=%s", worker_id, boot_id, process_id)
     while True:
         upd = await update_queue.get()
         try:
-            await dp.feed_raw_update(bot, upd)
+            await _handle_one_update(upd)
         except Exception as e:
-            log.error("🔥 feed_raw_update failed: %r", e)
+            log.error("🔥 feed_raw_update failed (worker=%s): %r", worker_id, e)
             log.error(traceback.format_exc())
         finally:
             update_queue.task_done()
 
 
 # =========================
-# Webhook server lifecycle
+# Webhook server lifecycle (armored)
 # =========================
 async def app_lifecycle(app: web.Application):
     global gs_http
     log.info("🚀 BOOT boot_id=%s pid=%s", boot_id, process_id)
 
-    await load_state()
+    worker_tasks: List[asyncio.Task] = []
 
-    gs_timeout = ClientTimeout(total=25, connect=10, sock_connect=10, sock_read=25)
-    gs_http = ClientSession(timeout=gs_timeout)
+    try:
+        await load_state()
 
-    app["worker_task"] = asyncio.create_task(update_worker())
+        gs_timeout = ClientTimeout(total=25, connect=10, sock_connect=10, sock_read=25)
+        gs_http = ClientSession(timeout=gs_timeout)
 
-    if WEBHOOK_BASE:
-        webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
+        # start workers
+        for i in range(WORKERS):
+            t = asyncio.create_task(update_worker(i + 1))
+            worker_tasks.append(t)
+        app["worker_tasks"] = worker_tasks
+
+        if WEBHOOK_BASE:
+            webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
+            try:
+                await bot.delete_webhook(drop_pending_updates=True)
+                await bot.set_webhook(webhook_url, allowed_updates=["message", "callback_query"])
+                log.info("✅ Webhook set to: %s", webhook_url)
+            except Exception as e:
+                log.exception("❌ set_webhook failed: %r", e)
+        else:
+            log.warning("WEBHOOK_BASE is empty. Webhook will NOT be set.")
+
+        yield  # RUNNING
+
+    finally:
+        # shutdown (always)
         try:
             await bot.delete_webhook(drop_pending_updates=True)
-            await bot.set_webhook(webhook_url, allowed_updates=["message", "callback_query"])
-            log.info("✅ Webhook set to: %s", webhook_url)
-        except Exception as e:
-            log.exception("❌ set_webhook failed: %r", e)
-    else:
-        log.warning("WEBHOOK_BASE is empty. Webhook will NOT be set.")
-
-    yield  # RUNNING
-
-    # shutdown
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-
-    wt: asyncio.Task = app.get("worker_task")
-    if wt:
-        wt.cancel()
-        try:
-            await wt
         except Exception:
             pass
 
-    if gs_http is not None:
+        # stop workers
+        for t in worker_tasks:
+            t.cancel()
+        for t in worker_tasks:
+            try:
+                await t
+            except Exception:
+                pass
+
+        if gs_http is not None:
+            try:
+                await gs_http.close()
+            except Exception:
+                pass
+            gs_http = None
+
         try:
-            await gs_http.close()
+            await bot.session.close()
         except Exception:
             pass
-        gs_http = None
 
-    try:
-        await bot.session.close()
-    except Exception:
-        pass
+        log.info("🧹 SHUTDOWN done boot_id=%s pid=%s", boot_id, process_id)
 
 
 async def handle_webhook(request: web.Request):
@@ -937,7 +998,19 @@ def build_app():
     async def health(_request):
         return web.Response(text="ok")
 
+    async def healthz(_request):
+        # useful for Render health check
+        return web.json_response({
+            "ok": True,
+            "boot_id": boot_id,
+            "pid": process_id,
+            "queue": update_queue.qsize(),
+            "workers": WORKERS,
+            "inflight_limit": MAX_INFLIGHT,
+        })
+
     app.router.add_get("/", health)
+    app.router.add_get("/healthz", healthz)
     app.router.add_post(WEBHOOK_PATH, handle_webhook)
 
     app.cleanup_ctx.append(app_lifecycle)
@@ -946,6 +1019,7 @@ def build_app():
 
 if __name__ == "__main__":
     web.run_app(build_app(), host="0.0.0.0", port=PORT)
+
 
 
 
